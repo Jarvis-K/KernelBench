@@ -78,7 +78,7 @@ class KernelExecResult(BaseModel):
     """
     Single Kernel Execution
     """
-
+    iteration: int = -1
     compiled: bool = False
     correctness: bool = False
     metadata: dict = {}
@@ -86,6 +86,7 @@ class KernelExecResult(BaseModel):
     runtime_stats: dict = {}  # only recorded if we decide to measure performance
     baseline_runtime: float = -1.0  # in us, only recorded if we decide to measure performance
     baseline_runtime_stats: dict = {}  # only recorded if we decide to measure performance
+    speed_up: float = 0.0  # only recorded if we decide to measure performance
 
 
 def load_original_model_and_inputs(
@@ -372,7 +373,7 @@ def eval_kernel_against_ref(
             graceful_eval_cleanup(context, device)
             return None
         else:
-            metadata["compilation_error"] = e
+            metadata["compilation_error"] = str(e)
             graceful_eval_cleanup(context, device)
             return KernelExecResult(
                 compiled=False, metadata=metadata
@@ -393,7 +394,14 @@ def eval_kernel_against_ref(
         )
         # TODO: add metadata for runtime error e.g. error in launching kernel, illegal memory access, ...
         graceful_eval_cleanup(context, device)
-        metadata["runtime_error"] = e
+        metadata["runtime_error"] = str(e)
+        return KernelExecResult(
+            compiled=True, correctness=False, metadata=metadata
+        )  # skip further steps
+    except Exception as e:
+        print(f"[Eval] Error in loading custom CUDA kernel: {e}")
+        graceful_eval_cleanup(context, device)
+        metadata["runtime_error"] = str(e)
         return KernelExecResult(
             compiled=True, correctness=False, metadata=metadata
         )  # skip further steps
@@ -416,7 +424,7 @@ def eval_kernel_against_ref(
         )
     except Exception as e:
         # TODO: add metadata for runtime error e.g. error in launching kernel, illegal memory access, ...
-        metadata["runtime_error"] = e
+        metadata["runtime_error"] = str(e)
         kernel_exec_result = KernelExecResult(
             compiled=True, correctness=False, metadata=metadata
         )
@@ -468,10 +476,12 @@ def eval_kernel_against_ref(
                     print(f"[Eval] Baseline Performance Stats: {baseline_runtime_stats}")
                 kernel_exec_result.baseline_runtime = baseline_runtime_stats["mean"]
                 kernel_exec_result.baseline_runtime_stats = baseline_runtime_stats
+
+                kernel_exec_result.speed_up = kernel_exec_result.baseline_runtime / kernel_exec_result.runtime
         except Exception as e:
             if verbose:
                 print(f"[Eval] Error in Measuring Performance: {e}")
-            kernel_exec_result.metadata["error_during_performance"] = e
+            kernel_exec_result.metadata["error_during_performance"] = str(e)
 
     graceful_eval_cleanup(context, device)
     return kernel_exec_result
@@ -648,7 +658,7 @@ def run_and_check_correctness(
                 print(f"Error in launching kernel for ModelNew: {e}")
 
                 metadata = register_and_format_exception(
-                    "runtime_error", e, metadata, truncate=True
+                    "runtime_error", str(e), metadata, truncate=True
                 )
                 return KernelExecResult(
                     compiled=True, correctness=False, metadata=metadata

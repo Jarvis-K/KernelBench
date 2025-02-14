@@ -108,6 +108,7 @@ def generate_sample_single(work: WorkArgs, config: GenerationConfig, dataset, in
 
     # Query server with constructed prompt
     custom_cuda = inference_server(custom_cuda_prompt)
+    print(f"Custom CUDA: {custom_cuda}")
     custom_cuda = extract_first_code(custom_cuda, ["python", "cpp"])
     # check LLM is able to generate custom CUDA code
     assert custom_cuda is not None, "Custom CUDA code generation failed"

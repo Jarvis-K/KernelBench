@@ -47,7 +47,7 @@ SGLANG_KEY = os.environ.get("SGLANG_API_KEY")  # for Local Deployment
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
 SAMBANOVA_API_KEY = os.environ.get("SAMBANOVA_API_KEY")
 PANDAS_API_KEY = os.environ.get("PANDAS_API_KEY")
-
+VOLCENGINE_API_KEY = os.environ.get("VOLCENGINE_API_KEY")
 
 
 ########################################################
@@ -159,6 +159,14 @@ def query_server(
                 max_retries=3,
             )
             model = model_name
+        case "volcengine":
+            client = OpenAI(
+                api_key=VOLCENGINE_API_KEY,
+                base_url="https://ark.cn-beijing.volces.com/api/v3",
+                timeout=10000000,
+                max_retries=3,
+            )
+            model = model_name
         case _:
             raise NotImplementedError
 
@@ -226,7 +234,7 @@ def query_server(
             )
         else: # deepseek reasoner
 
-            assert model == "deepseek-reasoner", "Only support deepseek-reasoner for now"
+            assert model == "deepseek-reasoner" or model == "deepseek-r1" or model == "Deepseek-r1", "Only support deepseek-reasoner or deepseek-r1 for now"
             response = client.chat.completions.create(
                     model=model,
                     messages=[
@@ -235,7 +243,7 @@ def query_server(
                 ],
                 stream=False,
                 n=num_completions,
-                max_tokens=max_tokens,
+                max_tokens=max_tokens*2,
                 # do not use temperature or top_p
             )
 
@@ -303,6 +311,18 @@ def query_server(
         )
         outputs = response
     # for all other kinds of servers, use standard API
+    elif server_type == "volcengine":
+        response = client.chat.completions.create(
+                model=model,
+                messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            stream=False,
+            n=num_completions,
+            max_tokens=max_tokens,
+        )
+        outputs = [choice.message.content for choice in response.choices]
     else:
         if type(prompt) == str:
             response = client.completions.create(
@@ -380,6 +400,11 @@ SERVER_PRESETS = {
         "model_name": "llama-3.1-405b",
         "temperature": 0.0,
         "max_tokens": 4096,
+    },
+    "volcengine": {
+        "model_name": "Deepseek-r1",
+        "temperature": 0.0,
+        "max_tokens": 8192,
     },
 }
 

@@ -359,6 +359,7 @@ def add_to_eval_results_file(problem_id: int, sample_id: int, eval_result: Kerne
         'runtime_stats': eval_result.runtime_stats,
         'baseline_runtime': eval_result.baseline_runtime,
         'baseline_runtime_stats': eval_result.baseline_runtime_stats,
+        'speed_up': eval_result.speed_up,
     }
     
     # Write updated results back to file
