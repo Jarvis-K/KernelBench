@@ -58,8 +58,10 @@ class EvalConfig(Config):
 
         # Construct this from mapping from architecture name to torch cuda arch list in the future
         # you can either specify SM version or just use the name
+        self.device_id = REQUIRED
         self.gpu_arch = ["Ada"]
 
+        self.model_name = REQUIRED
 
         # Logging
         # Top Directory to Store Runs
@@ -149,7 +151,7 @@ def evaluate_single_sample(work_args: WorkArgs, configs: EvalConfig, dataset, ru
 
     assert kernel_src is not None, f"Kernel not found for problem {problem_id} sample {sample_id}"
 
-    build_dir = os.path.join(configs.kernel_eval_build_dir, configs.run_name, f"{problem_id}", f"{sample_id}")
+    build_dir = os.path.join(configs.kernel_eval_build_dir, configs.run_name, configs.model_name, f"{problem_id}", f"{sample_id}")
 
     try: 
         eval_result = eval_kernel_against_ref(
@@ -212,12 +214,12 @@ def cuda_single_eval_wrapper(curr_work: WorkArgs, configs: dict, dataset, run_di
         return result
 
 
-def remove_cache_dir(cache_dir: str, run_name: str, problem_id, sample_id):
+def remove_cache_dir(cache_dir: str, run_name: str, model_name: str, problem_id, sample_id):
     """
     Remove the cached folder for sample compilation so it can start a clean build next time
     useful for time out, failed build, etc.
     """
-    problem_cache_dir = os.path.join(cache_dir, run_name, f"{problem_id}", f"{sample_id}")
+    problem_cache_dir = os.path.join(cache_dir, run_name, model_name, f"{problem_id}", f"{sample_id}")
     print(f"cache_dir to remove: {problem_cache_dir}")
     if os.path.exists(cache_dir):
         try:
@@ -258,7 +260,7 @@ def batch_eval(
                         WorkArgs(
                             problem_id=p_id,
                             sample_id=s_idx,
-                            device=torch.device(f"cuda:{i%batch_size}"),
+                            device=torch.device(f"cuda:{config.device_id}"),
                         ),
                         config,
                         curr_level_dataset,
@@ -293,13 +295,13 @@ def batch_eval(
                         )
                         results.append((problem_id, sample_id, None))
                     
-                        remove_cache_dir(config.kernel_eval_build_dir, config.run_name, problem_id, sample_id)
+                        remove_cache_dir(config.kernel_eval_build_dir, config.run_name, config.model_name, problem_id, sample_id)
                     except Exception as e:
                         print(
                             f"[ERROR] Evaluation FAILED for Problem ID: {problem_id}, Sample ID: {sample_id}: {str(e)}"
                         )
                         results.append((problem_id, sample_id, None))
-                        remove_cache_dir(config.kernel_eval_build_dir, config.run_name, problem_id, sample_id)
+                        remove_cache_dir(config.kernel_eval_build_dir, config.run_name, config.model_name, problem_id, sample_id)
 
                 end_time = time.time()
 
@@ -355,6 +357,8 @@ def add_to_eval_results_file(problem_id: int, sample_id: int, eval_result: Kerne
         'metadata': check_metadata_serializable_all_types(eval_result.metadata),
         'runtime': eval_result.runtime,
         'runtime_stats': eval_result.runtime_stats,
+        'baseline_runtime': eval_result.baseline_runtime,
+        'baseline_runtime_stats': eval_result.baseline_runtime_stats,
     }
     
     # Write updated results back to file
@@ -362,10 +366,10 @@ def add_to_eval_results_file(problem_id: int, sample_id: int, eval_result: Kerne
         os.makedirs(os.path.dirname(eval_file_path), exist_ok=True)
         
     with open(eval_file_path, "w") as f:
-        json.dump(eval_results, f)
+        json.dump(eval_results, f, indent=4)
 
 def single_eval_example(config: EvalConfig, curr_level_dataset: list[str], run_dir: str, eval_file_path ):
-    device = torch.device("cuda:0")
+    device = torch.device(f"cuda:{config.device_id}")
     example_work = WorkArgs(problem_id=1, sample_id=0, device=device)
     # example_eval_result = evaluate_single_sample(example_work, config, curr_level_dataset, run_dir)
     example_eval_result = cuda_single_eval_wrapper(example_work, config, curr_level_dataset, run_dir)
@@ -407,7 +411,7 @@ def main(config: EvalConfig):
 
     print(f"Evaluating 1 sample each for level {config.level} problems: {problem_id_range}")
 
-    run_dir = os.path.join(config.runs_dir, config.run_name)
+    run_dir = os.path.join(config.runs_dir, config.run_name, config.model_name)
     eval_file_path = os.path.join(run_dir, f"eval_results.json")
 
 

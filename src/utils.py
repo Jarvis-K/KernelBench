@@ -46,6 +46,7 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 SGLANG_KEY = os.environ.get("SGLANG_API_KEY")  # for Local Deployment
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
 SAMBANOVA_API_KEY = os.environ.get("SAMBANOVA_API_KEY")
+PANDAS_API_KEY = os.environ.get("PANDAS_API_KEY")
 
 
 
@@ -150,6 +151,14 @@ def query_server(
             assert os.path.exists(archon_config_path), f"Archon config path {archon_config_path} does not exist"
             client = Archon(json.load(open(archon_config_path)))
             model = model_name
+        case "pandas":
+            client = OpenAI(
+                api_key=PANDAS_API_KEY,
+                base_url="https://api.pandalla.ai/v1",
+                timeout=10000000,
+                max_retries=3,
+            )
+            model = model_name
         case _:
             raise NotImplementedError
 
@@ -199,7 +208,7 @@ def query_server(
 
         return response.text
 
-    elif server_type == "deepseek":
+    elif server_type == "deepseek" or (server_type == "pandas" and "deepseek" in model):
 
         if model in ["deepseek-chat", "deepseek-coder"]:
             # regular deepseek model 
@@ -231,7 +240,7 @@ def query_server(
             )
 
         outputs = [choice.message.content for choice in response.choices]
-    elif server_type == "openai":
+    elif server_type == "openai" or server_type == "pandas":
         if (
             "o1" in model
         ):  # o1 does not support system prompt and decode config
@@ -366,6 +375,11 @@ SERVER_PRESETS = {
     "archon": {
         "archon_config_path": "archon_configs/gpt-4-turbo.json",
         "model_name": "individual_gpt-4-turbo",
+    },
+    "pandas": {
+        "model_name": "llama-3.1-405b",
+        "temperature": 0.0,
+        "max_tokens": 4096,
     },
 }
 

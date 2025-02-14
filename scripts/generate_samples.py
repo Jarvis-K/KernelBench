@@ -166,7 +166,7 @@ def main(config: GenerationConfig):
     print(f"Generating on 1 sample each for level {config.level} problems: {problem_id_range}")
 
     # set up run directory
-    run_dir = os.path.join(config.runs_dir, config.run_name)
+    run_dir = os.path.join(config.runs_dir, config.run_name, config.model_name)
     os.makedirs(run_dir, exist_ok=True)
     pydra.save_yaml(config.to_dict(), os.path.join(run_dir, "generation_config.yaml"))
 

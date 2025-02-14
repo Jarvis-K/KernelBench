@@ -84,6 +84,8 @@ class KernelExecResult(BaseModel):
     metadata: dict = {}
     runtime: float = -1.0  # in us, only recorded if we decide to measure performance
     runtime_stats: dict = {}  # only recorded if we decide to measure performance
+    baseline_runtime: float = -1.0  # in us, only recorded if we decide to measure performance
+    baseline_runtime_stats: dict = {}  # only recorded if we decide to measure performance
 
 
 def load_original_model_and_inputs(
@@ -449,6 +451,23 @@ def eval_kernel_against_ref(
                     print(f"[Eval] Performance Stats: {runtime_stats}")
                 kernel_exec_result.runtime = runtime_stats["mean"]
                 kernel_exec_result.runtime_stats = runtime_stats
+
+                model = original_model.cuda(device=device)
+                torch.cuda.synchronize(device=device)
+
+                elapsed_times = time_execution_with_cuda_event(
+                    model,
+                    *inputs,
+                    num_trials=num_perf_trials,
+                    verbose=verbose,
+                    device=device,
+                )
+                baseline_runtime_stats = get_timing_stats(elapsed_times, device=device)
+
+                if verbose:
+                    print(f"[Eval] Baseline Performance Stats: {baseline_runtime_stats}")
+                kernel_exec_result.baseline_runtime = baseline_runtime_stats["mean"]
+                kernel_exec_result.baseline_runtime_stats = baseline_runtime_stats
         except Exception as e:
             if verbose:
                 print(f"[Eval] Error in Measuring Performance: {e}")
