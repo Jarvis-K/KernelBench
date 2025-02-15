@@ -18,6 +18,18 @@ REPO_TOP_PATH = os.path.abspath(
 )
 KERNEL_BENCH_PATH = os.path.join(REPO_TOP_PATH, "KernelBench")
 
+def parser_result(result, round=None):
+    s = f"In round {round}, " if round is not None else f"In round {result['iteration']+1}, "
+    if not result['compiled']:
+        s += f"the custom cuda code failed to compile. "
+    else:
+        s += f"the custom cuda code compiled successfully, "
+        if result['correctness']:
+            s += f"and the execution result of code is correct. "
+            s += f"The average runtime of custom cuda code is {result['runtime']}ms, and the original torch code is {result['baseline_runtime']}ms, the speed up is {result['speed_up']}. "
+        else:
+            s += f"but the execution result of the code is incorrect. "
+    return s
 
 def get_arch_definition_from_file(arch_path):
     arch_src = read_file(arch_path)
@@ -66,6 +78,54 @@ def prompt_generate_custom_cuda(
     {arc_src}
     ```
     """
+    prompt += PROBLEM_INSTRUCTION
+    return prompt
+
+def prompt_generate_custom_cuda_reflection(
+    arc_src, example_arch_src, example_new_arch_src, hist_responses, hist_results, recent_hist_flag, best_hist_flag
+):
+    prompt = PROBLEM_STATEMENT
+
+    if example_arch_src != "" and example_new_arch_src != "":
+        prompt += f"""
+        Here's an example to show you the syntax of inline embedding custom CUDA operators in torch: The example given architecture is: \n
+        ``` \n
+        {example_arch_src}
+        ``` \n
+        The example new arch with custom CUDA kernels looks like this: 
+        ```
+        {example_new_arch_src}
+        ``` \n
+        """
+
+    prompt += f"""
+    You are given the following architecture: \n
+    ```
+    {arc_src}
+    ```
+    """
+    if hist_results:
+        if best_hist_flag:
+            result = hist_results[-1]
+            response = hist_responses[-1]
+
+            improvement_prompt = f"Below is the best generated CUDA kernel code:\n"
+            improvement_prompt += f"```\n{response}\n```"
+            improvement_prompt += f"\n{parser_result(result)}\n\n"
+        elif recent_hist_flag:
+            result = hist_results[-1]
+            response = hist_responses[-1]
+            improvement_prompt = f"Below is the most recently generated CUDA kernel code:\n"
+            improvement_prompt += f"```\n{response}\n```"
+            improvement_prompt += f"\n{parser_result(result)}\n\n"
+        else:
+            improvement_prompt = f"Below is the previously generated CUDA kernel code:\n"
+            for i, (response, result) in enumerate(zip(hist_responses, hist_results)):
+                improvement_prompt += f"Round {i+1}:\n"
+                improvement_prompt += f"```\n{response}\n```"
+                improvement_prompt += f"\n{parser_result(result, round=i+1)}\n\n"
+
+        prompt += improvement_prompt
     prompt += PROBLEM_INSTRUCTION
     return prompt
 
@@ -333,6 +393,36 @@ def prompt_generate_custom_cuda_from_prompt_template(ref_arch_src: str) -> str:
     example_new_arch = read_file(example_new_arch_path)
 
     return prompt_generate_custom_cuda(arch, example_arch, example_new_arch)
+
+def prompt_generate_custom_cuda_from_prompt_template_reflection(ref_arch_src: str, hist_responses=None, hist_results=None, recent_hist_flag=False, best_hist_flag=False, example_flag=True) -> str:
+    """
+    Using prompt example (an element-wise addition) for prompt templates
+    The most basic form of example just to show LLM the task and the expected output format
+    """
+    arch = ref_arch_src
+    # These are strictly defined for now
+
+    # path to prompt template, show an example of Model (torch specifications) and ModelNew (torch + custom CUDA kernels)
+    example_arch_path = os.path.join(
+        REPO_TOP_PATH, f"src/prompts/model_ex_add.py"
+    )
+    example_new_arch_path = os.path.join(
+        REPO_TOP_PATH, f"src/prompts/model_new_ex_add.py"
+    )
+
+    if not os.path.exists(example_arch_path):
+        raise FileNotFoundError(
+            f"Example architecture file not found: {example_arch_path}"
+        )
+    if not os.path.exists(example_new_arch_path):
+        raise FileNotFoundError(
+            f"Example new architecture file not found: {example_new_arch_path}"
+        )
+
+    example_arch = read_file(example_arch_path) if example_flag else ""
+    example_new_arch = read_file(example_new_arch_path) if example_flag else ""
+
+    return prompt_generate_custom_cuda_reflection(arch, example_arch, example_new_arch, hist_responses, hist_results, recent_hist_flag, best_hist_flag)
 
 
 def prompt_generate_prompt_with_hardware_info_from_template(ref_arch_src: str, gpu_name: str) -> str:

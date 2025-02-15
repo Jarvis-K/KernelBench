@@ -8,7 +8,7 @@ from datasets import load_dataset
 
 from src.dataset import construct_kernelbench_dataset
 from src.eval import eval_kernel_against_ref
-from src.prompt_constructor import prompt_generate_custom_cuda_from_prompt_template
+from src.prompt_constructor import prompt_generate_custom_cuda_from_prompt_template, prompt_generate_custom_cuda_from_prompt_template_reflection
 from src.utils import extract_first_code, query_server, set_gpu_arch, read_file, create_inference_server_from_presets
 
 """
@@ -64,11 +64,13 @@ class EvalConfig(Config):
         self.temperature = 0.0
         self.max_iteration = 5
         self.device_id = 0
+        self.reflection = True
         # Logging
         self.logdir = os.path.join(REPO_TOP_DIR, "results/eval_logs")
         self.verbose = False
         self.recent_hist_flag = False
         self.best_hist_flag = False
+        self.example_flag = False
         self.hist_num = 5
 
     def __repr__(self):
@@ -79,6 +81,7 @@ class KernelAgent:
         self.config = config
         self.init_prompt = None
         self.current_prompt = None
+        self.ref_arch_src = None
 
         self.prompts = []
         self.responses = []
@@ -100,50 +103,19 @@ class KernelAgent:
         self.prompts.append(prompt)
 
     def refine_prompt(self):
-        if not self.config.recent_hist_flag and not self.config.best_hist_flag:
-            improvement_prompt = f"Below is the previously generated CUDA kernel code:\n"
-            for round, result in enumerate(self.results[-self.config.hist_num:]):
-                improvement_prompt += f"\nRound {round+1}:\n"
-                improvement_prompt += f"```\n{self.responses[round]}\n```"
-                # improvement_prompt += f"\nThe evaluation result of this code was:"
-                # improvement_prompt += f"\n{result}"
-                improvement_prompt += f"\n{parser_result(result)}"
-            
-            improvement_prompt += (
-                "\n\nOptimize the architecture named Model with custom CUDA operators! "
-                "Name your optimized output architecture ModelNew. Output the new code in codeblocks. "
-                "Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. "
-                "Just output the new model code, no other text, and NO testing code!"
-            )
-        elif self.config.recent_hist_flag:
-            result = self.results[-1]
-            improvement_prompt = f"Below is the most recently generated CUDA kernel code:\n"
-            improvement_prompt += f"```\n{self.responses[-1]}\n```"
-            # improvement_prompt += f"\nThe evaluation result of this code was:"
-            # improvement_prompt += f"\n{result}"
-            improvement_prompt += f"\n{parser_result(result)}"
-            improvement_prompt += (
-                "\n\nOptimize the architecture named Model with custom CUDA operators! "
-                "Name your optimized output architecture ModelNew. Output the new code in codeblocks. "
-                "Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. "
-                "Just output the new model code, no other text, and NO testing code!"
-            )
-        elif self.config.best_hist_flag:
-            improvement_prompt = f"Below is the best generated CUDA kernel code:\n"
-            improvement_prompt += f"```\n{self.best_response}\n```"
-            # improvement_prompt += f"\nThe evaluation result of this code was:"
-            # improvement_prompt += f"\n{self.best_result}"
-            improvement_prompt += f"\n{parser_result(self.best_result)}"
-            
-            improvement_prompt += (
-                "\n\nOptimize the architecture named Model with custom CUDA operators! "
-                "Name your optimized output architecture ModelNew. Output the new code in codeblocks. "
-                "Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. "
-                "Just output the new model code, no other text, and NO testing code!"
-            )
+        if self.config.reflection:
+            if not self.config.best_hist_flag:
+                hist_responses = self.responses[-self.config.hist_num:]
+                hist_results = self.results[-self.config.hist_num:]
+                improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_responses, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=self.config.example_flag)
+            else:
+                hist_responses = [self.best_response]
+                hist_results = [self.best_result]
+                improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_responses, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=self.config.example_flag)
+        else:
+            improvement_prompt = prompt_generate_custom_cuda_from_prompt_template(self.ref_arch_src)
 
-        self.current_prompt = self.init_prompt + improvement_prompt
-        # self.current_prompt = self.init_prompt
+        self.current_prompt = improvement_prompt
         self.prompts.append(self.current_prompt)
 
     def get_results(self, ref_arch_src, num_correct_trials=5, num_perf_trials=100, verbose=False):
@@ -242,7 +214,7 @@ def main(config: EvalConfig):
     迭代生成并评估 CUDA 核函数，最终输出最佳结果
     """
     print(f"Starting Eval with config: {config}")
-    kernel_agent = KernelAgent(config)
+    
 
     # 配置数据集
     if config.dataset_src == "huggingface":
@@ -279,7 +251,8 @@ def main(config: EvalConfig):
     assert problem_number == config.problem_id, (
         f"Problem number in filename ({problem_number}) does not match config problem_id ({config.problem_id})"
     )
-    
+    kernel_agent = KernelAgent(config)
+
     # 2. 初始化推理服务及初始 prompt
     inference_server = create_inference_server_from_presets(
         server_type=config.server_type,
@@ -291,8 +264,9 @@ def main(config: EvalConfig):
         time_generation=True
     )
     kernel_agent.initialize_server(inference_server)
+    kernel_agent.ref_arch_src = ref_arch_src
 
-    custom_cuda_prompt = prompt_generate_custom_cuda_from_prompt_template(ref_arch_src)
+    custom_cuda_prompt = prompt_generate_custom_cuda_from_prompt_template(ref_arch_src) if not config.reflection else prompt_generate_custom_cuda_from_prompt_template_reflection(ref_arch_src, example_flag=True)
     kernel_agent.initialize_prompt(custom_cuda_prompt)
 
     # 3. 迭代生成和评估

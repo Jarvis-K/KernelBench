@@ -483,7 +483,11 @@ def eval_kernel_against_ref(
                 print(f"[Eval] Error in Measuring Performance: {e}")
             kernel_exec_result.metadata["error_during_performance"] = str(e)
 
-    graceful_eval_cleanup(context, device)
+    try:
+        graceful_eval_cleanup(context, device)
+    except:
+        pass 
+        
     return kernel_exec_result
 
 
