@@ -20,19 +20,6 @@ REPO_TOP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 torch.set_printoptions(precision=4, threshold=10)
 
-def parser_result(result):
-    s = f"In round {result['iteration']+1}, "
-    if not result['compiled']:
-        s += f"the custom cuda code failed to compile. "
-    else:
-        s += f"the custom cuda code compiled successfully, "
-        if result['correctness']:
-            s += f"and the execution result of code is correct. "
-            s += f"The average runtime of custom cuda code is {result['runtime']}ms, and the original torch code is {result['baseline_runtime']}ms, the speed up is {result['speed_up']}. "
-        else:
-            s += f"but the execution result of the code is incorrect. "
-    return s
-
 class EvalConfig(Config):
     def __init__(self):
         
@@ -284,6 +271,11 @@ def main(config: EvalConfig):
     # print(f"Best response:\n{kernel_agent.best_response}")
     kernel_agent.draw_results()
     print(f"Best evaluation result:\n{kernel_agent.best_result}")
+
+    if kernel_agent.results[0]['speed_up'] < 1.0 and kernel_agent.best_result['speed_up'] > 1.0:
+        print(f"There's a huge improvement in problem {config.problem_id}!")
+    else:
+        print(f"No huge improvement~")
 
 if __name__ == "__main__":
     main()
