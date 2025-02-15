@@ -153,8 +153,8 @@ class KernelAgent:
                     self.best_result = result
                     print(f"Best result updated: {self.best_result}")
                 else:
-                    if "runtime" in result and "runtime" in self.best_result:
-                        if result["runtime"] < self.best_result["runtime"]:
+                    if "speed_up" in result and "speed_up" in self.best_result:
+                        if result["speed_up"] > self.best_result["speed_up"]:
                             self.best_prompt = self.current_prompt
                             self.best_response = response
                             self.best_result = result

@@ -21,14 +21,14 @@ KERNEL_BENCH_PATH = os.path.join(REPO_TOP_PATH, "KernelBench")
 def parser_result(result, round=None):
     s = f"In round {round}, " if round is not None else f"In round {result['iteration']+1}, "
     if not result['compiled']:
-        s += f"the custom cuda code failed to compile. "
+        s += f"the custom cuda code failed to compile. The error is: {str(result['metadata'])[:200]}..."
     else:
         s += f"the custom cuda code compiled successfully, "
         if result['correctness']:
             s += f"and the execution result of code is correct. "
             s += f"The average runtime of custom cuda code is {result['runtime']}ms, and the original torch code is {result['baseline_runtime']}ms, the speed up is {result['speed_up']}. "
         else:
-            s += f"but the execution result of the code is incorrect. "
+            s += f"but the execution result of the code is incorrect. The error is: {str(result['metadata']['correctness_issue'])[:200]}..."
     return s
 
 def get_arch_definition_from_file(arch_path):
