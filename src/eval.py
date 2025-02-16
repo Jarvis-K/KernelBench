@@ -69,6 +69,8 @@ def fetch_ref_arch_from_level_problem_id(level, problem_id, with_name=False):
 
 
 def set_seed(seed: int):
+    np.random.seed(seed)
+    random.seed(seed)
     torch.manual_seed(seed)
     # NOTE: this only sets on current cuda device
     torch.cuda.manual_seed(seed)

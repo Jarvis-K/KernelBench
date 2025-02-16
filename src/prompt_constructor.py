@@ -28,7 +28,7 @@ def parser_result(result, round=None):
             s += f"and the execution result of code is correct. "
             s += f"The average runtime of custom cuda code is {result['runtime']}ms, and the original torch code is {result['baseline_runtime']}ms, the speed up is {result['speed_up']}. "
         else:
-            s += f"but the execution result of the code is incorrect. The error is: {str(result['metadata']['correctness_issue'])[:200]}..."
+            s += f"but the execution result of the code is incorrect. The error is: {str(result['metadata'])[:200]}..."
     return s
 
 def get_arch_definition_from_file(arch_path):
