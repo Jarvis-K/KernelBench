@@ -8,7 +8,7 @@ from datasets import load_dataset
 
 from src.dataset import construct_kernelbench_dataset
 from src.eval import eval_kernel_against_ref
-from src.prompt_constructor import prompt_generate_custom_cuda_from_prompt_template, prompt_generate_custom_cuda_from_prompt_template_reflection
+from src.prompt_constructor import prompt_generate_custom_cuda_from_prompt_template_s1
 from src.utils import extract_first_code, query_server, set_gpu_arch, read_file, create_inference_server_from_presets
 
 """
@@ -59,6 +59,7 @@ class EvalConfig(Config):
         self.best_hist_flag = False
         self.example_flag = False
         self.hist_num = 5
+        self.wait_num = 3
 
     def __repr__(self):
         return f"EvalConfig({self.to_dict()})"
@@ -75,13 +76,21 @@ class KernelAgent:
         self.results = []
         self.codes = []
 
+        self.wait_responses = []
+        self.wait_results = []
+
+        self.best_prompts = []
+        self.best_responses = []
+        self.best_results = []
+        self.best_codes = []
+
         self.best_prompt = None
         self.best_response = None
         self.best_result = None
         self.best_code = None
-
         self.iteration_num = 0
-        self.output_dir = os.path.join(self.config.logdir, self.config.model_name, f"level_{self.config.level}", f"problem_{self.config.problem_id}")
+        self.wait_num = 0
+        self.output_dir = os.path.join(self.config.logdir, 's1', self.config.model_name, f"level_{self.config.level}", f"problem_{self.config.problem_id}")
 
     def initialize_server(self, inference_server):
         self.inference_server = inference_server
@@ -92,17 +101,10 @@ class KernelAgent:
         self.prompts.append(prompt)
 
     def refine_prompt(self):
-        if self.config.reflection:
-            if not self.config.best_hist_flag:
-                hist_codes = self.codes[-self.config.hist_num:]
-                hist_results = self.results[-self.config.hist_num:]
-                improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=self.config.example_flag)
-            else:
-                hist_codes = [self.best_code]
-                hist_results = [self.best_result]
-                improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=self.config.example_flag)
+        if self.iteration_num == 0:
+            improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_s1(self.ref_arch_src, self.best_codes, self.best_results, example_flag=True, wait_responses=self.wait_responses, wait_results=self.wait_results, model=self.config.model_name)
         else:
-            improvement_prompt = prompt_generate_custom_cuda_from_prompt_template(self.ref_arch_src)
+            improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_s1(self.ref_arch_src, self.best_codes, self.best_results, example_flag=self.config.example_flag, wait_responses=self.wait_responses, wait_results=self.wait_results, model=self.config.model_name)
 
         self.current_prompt = improvement_prompt
         self.prompts.append(self.current_prompt)
@@ -110,11 +112,12 @@ class KernelAgent:
     def get_results(self, ref_arch_src, num_correct_trials=5, num_perf_trials=100, verbose=False):
         # 调用推理服务器生成响应
         response = self.inference_server(self.current_prompt)
+        self.wait_responses.append(response)
         # 提取首个代码块（指定语言：python 或 cpp）
-        self.responses.append(response)
         code = extract_first_code(response, ["python", "cpp"])
         # 确保生成了有效的代码
-        assert code is not None, f"Custom CUDA code generation failed in iteration {self.iteration_num}"
+        assert response is not None, f"Custom CUDA code generation failed in iteration {self.iteration_num}"
+        self.responses.append(response)
         self.codes.append(code)
         # 评估生成的 CUDA 代码
         result = eval_kernel_against_ref(
@@ -126,9 +129,11 @@ class KernelAgent:
             num_perf_trials=num_perf_trials,
             device = torch.device(f"cuda:{self.config.device_id}")
         )
+        result.iteration = self.iteration_num
         result = vars(result)
-        result['iteration'] = self.iteration_num
+        result["wait_num"] = self.wait_num
         self.results.append(result)
+        self.wait_results.append(result)
 
         if self.best_result is None:
             self.best_prompt = self.current_prompt
@@ -152,35 +157,50 @@ class KernelAgent:
                             self.best_result = result
                             self.best_code = code
                             print(f"Best result updated: {self.best_result}")
-        self.iteration_num += 1
+        self.wait_num += 1
+        if self.wait_num >= self.config.wait_num:
+            self.wait_num = 0
+            self.iteration_num += 1
+            self.wait_responses = []
+            self.wait_results = []
+            
+            self.best_responses.append(self.best_response)
+            self.best_results.append(self.best_result)
+            self.best_prompts.append(self.best_prompt)
+            self.best_codes.append(self.best_code)
+            self.best_response = None
+            self.best_result = None
+            self.best_prompt = None
+            self.best_code = None
 
     def update_speedup(self, ):
         baseline_results = [result for result in self.results if result["correctness"]]
         if len(baseline_results) == 0:
             print("No correct results found, cannot update speedup")
             for i, result in enumerate(self.results):
-                self.save_results(i)
+                self.save_results(result["iteration"], result["wait_num"])
         else:
             min_baseline_runtime = min([result["baseline_runtime"] for result in baseline_results])
             for i, result in enumerate(self.results):
-                self.results[i]["speed_up"] = min_baseline_runtime / result["runtime"]
-                self.save_results(i)
+                self.results[i]["speed_up"] = max(0.0, min_baseline_runtime / result["runtime"])
+                self.save_results(result["iteration"], result["wait_num"])
 
-    def save_results(self, iteration_num=0):
+    def save_results(self, iteration_num=0, wait_num=0):
         # 保存当前迭代的 prompt、response 和 result 到指定目录
         os.makedirs(self.output_dir, exist_ok=True)
         
-        iteration_dir = os.path.join(self.output_dir, f"iteration_{iteration_num}")
+        iteration_dir = os.path.join(self.output_dir, f"iteration_{iteration_num}_wait_{wait_num}")
         os.makedirs(iteration_dir, exist_ok=True)
 
         with open(os.path.join(iteration_dir, "prompt.txt"), "w") as f:
-            f.write(self.prompts[iteration_num])
-        with open(os.path.join(iteration_dir, "response.txt"), "w") as f:
-            f.write(self.responses[iteration_num])
+            f.write(self.prompts[iteration_num*self.config.wait_num+wait_num])
         with open(os.path.join(iteration_dir, "result.json"), "w") as f:
-            json.dump(self.results[iteration_num], f, indent=4)
-        with open(os.path.join(iteration_dir, "kernel_code.py"), "w") as f:
-            f.write(self.codes[iteration_num])
+            json.dump(self.results[iteration_num*self.config.wait_num+wait_num], f, indent=4)
+        with open(os.path.join(iteration_dir, "response.txt"), "w") as f:
+            f.write(self.responses[iteration_num*self.config.wait_num+wait_num])
+        if self.codes[iteration_num*self.config.wait_num+wait_num]:
+            with open(os.path.join(iteration_dir, "code.py"), "w") as f:
+                f.write(self.codes[iteration_num*self.config.wait_num+wait_num])
         
         # 汇总所有迭代的评估结果到一个 JSON 文件中
         eval_results_path = os.path.join(self.output_dir, "eval_results.json")
@@ -190,14 +210,18 @@ class KernelAgent:
         # 保存最佳结果到专门的文件夹中
         best_dir = os.path.join(self.output_dir, "best_results")
         os.makedirs(best_dir, exist_ok=True)
-        with open(os.path.join(best_dir, "best_prompt.txt"), "w") as f:
-            f.write(self.best_prompt)
-        with open(os.path.join(best_dir, "best_response.txt"), "w") as f:
-            f.write(self.best_response)
-        with open(os.path.join(best_dir, "best_result.json"), "w") as f:
-            json.dump(self.best_result, f, indent=4)
-        with open(os.path.join(best_dir, "best_code.py"), "w") as f:
-            f.write(self.best_code)
+        if self.best_results:
+            best_results_idx = self.best_results.index(max(self.best_results, key=lambda x: x["speed_up"]))
+            with open(os.path.join(best_dir, "best_prompt.txt"), "w") as f:
+                f.write(self.best_prompts[best_results_idx])
+            with open(os.path.join(best_dir, "best_response.txt"), "w") as f:
+                f.write(self.best_responses[best_results_idx])
+            with open(os.path.join(best_dir, "best_result.json"), "w") as f:
+                json.dump(self.best_results[best_results_idx], f, indent=4)
+
+            if self.best_codes[best_results_idx]:
+                with open(os.path.join(best_dir, "best_code.py"), "w") as f:
+                    f.write(self.best_codes[best_results_idx])
 
     def draw_results(self):
         import matplotlib.pyplot as plt
@@ -216,6 +240,11 @@ class KernelAgent:
         plt.title('Speed Up of Each Iteration')
         plt.savefig(os.path.join(self.output_dir, "speed_up_plot.png"))
         plt.close()
+
+    def get_best_result(self,):
+        best_results_idx = self.best_results.index(max(self.best_results, key=lambda x: x["speed_up"]))
+        return self.best_results[best_results_idx]
+
 
 @pydra.main(base=EvalConfig)
 def main(config: EvalConfig):
@@ -275,18 +304,17 @@ def main(config: EvalConfig):
     kernel_agent.initialize_server(inference_server)
     kernel_agent.ref_arch_src = ref_arch_src
 
-    custom_cuda_prompt = prompt_generate_custom_cuda_from_prompt_template(ref_arch_src) if not config.reflection else prompt_generate_custom_cuda_from_prompt_template_reflection(ref_arch_src, example_flag=True)
+    custom_cuda_prompt = prompt_generate_custom_cuda_from_prompt_template_s1(ref_arch_src, example_flag=True)
     kernel_agent.initialize_prompt(custom_cuda_prompt)
 
     # 3. 迭代生成和评估
     for i in range(config.max_iteration):
         print(f"Iteration {i+1} / {config.max_iteration}")
-        kernel_agent.get_results(ref_arch_src, num_correct_trials=5, num_perf_trials=100, verbose=config.verbose)
-        kernel_agent.save_results(iteration_num=i)
-        # print(f"Iteration {i+1} Response:\n{kernel_agent.responses[-1]}")
-        print(f"Iteration {i+1} Evaluation:\n{kernel_agent.results[-1]}")
-        # 如果不是最后一轮则更新 prompt
-        if i < config.max_iteration - 1:
+        for j in range(config.wait_num):
+            kernel_agent.get_results(ref_arch_src, num_correct_trials=5, num_perf_trials=100, verbose=config.verbose)
+            kernel_agent.save_results(iteration_num=i, wait_num=j)
+            # print(f"Iteration {i+1} Response:\n{kernel_agent.responses[-1]}")
+            print(f"Iteration {i+1} wait {j} Evaluation:\n{kernel_agent.results[-1]}")
             kernel_agent.refine_prompt()
 
     kernel_agent.update_speedup()
@@ -294,9 +322,10 @@ def main(config: EvalConfig):
     # print(f"Best prompt:\n{kernel_agent.best_prompt}")
     # print(f"Best response:\n{kernel_agent.best_response}")
     kernel_agent.draw_results()
-    print(f"Best evaluation result:\n{kernel_agent.best_result}")
-
-    if kernel_agent.results[0]['speed_up'] < 1.0 and kernel_agent.best_result['speed_up'] > 1.0:
+    
+    best_result = kernel_agent.get_best_result()
+    print(f"Best evaluation result:\n{best_result}")
+    if kernel_agent.results[0]['speed_up'] < 1.0 and best_result['speed_up'] > 1.0:
         print(f"There's a huge improvement in problem {config.problem_id}!")
     else:
         print(f"No huge improvement~")

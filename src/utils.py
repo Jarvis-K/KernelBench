@@ -48,7 +48,7 @@ ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
 SAMBANOVA_API_KEY = os.environ.get("SAMBANOVA_API_KEY")
 PANDAS_API_KEY = os.environ.get("PANDAS_API_KEY")
 VOLCENGINE_API_KEY = os.environ.get("VOLCENGINE_API_KEY")
-
+SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY")
 
 ########################################################
 # Inference Helpers
@@ -167,6 +167,30 @@ def query_server(
                 max_retries=3,
             )
             model = model_name
+        case "volcengine-completion":
+            client = OpenAI(
+                api_key=VOLCENGINE_API_KEY,
+                base_url="https://ark.cn-beijing.volces.com/api/v3",
+                timeout=10000000,
+                max_retries=3,
+            )
+            model = model_name
+        case "siliconflow":
+            client = OpenAI(
+                api_key=SILICONFLOW_API_KEY,
+                base_url="https://api.siliconflow.cn/v1",
+                timeout=10000000,
+                max_retries=3,
+            )
+            model = model_name
+        case "pandas-completion":
+            client = OpenAI(
+                api_key=PANDAS_API_KEY,
+                base_url="https://api.pandalla.ai/v1",
+                timeout=10000000,
+                max_retries=3,
+            )
+            model = model_name
         case _:
             raise NotImplementedError
 
@@ -223,7 +247,7 @@ def query_server(
             response = client.chat.completions.create(
                     model=model,
                     messages=[
-                    {"role": "system", "content": system_prompt},
+                    # {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},
                 ],
                 stream=False,
@@ -238,7 +262,7 @@ def query_server(
             response = client.chat.completions.create(
                     model=model,
                     messages=[
-                    {"role": "system", "content": system_prompt},
+                    # {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},
                 ],
                 stream=False,
@@ -263,7 +287,7 @@ def query_server(
             response = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": system_prompt},
+                    # {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},
                 ],
                 stream=False,
@@ -315,6 +339,18 @@ def query_server(
         response = client.chat.completions.create(
                 model=model,
                 messages=[
+                # {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            stream=False,
+            n=num_completions,
+            max_tokens=max_tokens,
+        )
+        outputs = [choice.message.content for choice in response.choices]
+    elif server_type == "siliconflow":
+        response = client.chat.completions.create(
+                model=model,
+                messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
@@ -323,6 +359,18 @@ def query_server(
             max_tokens=max_tokens,
         )
         outputs = [choice.message.content for choice in response.choices]
+    elif "completion" in server_type:
+        response = client.completions.create(
+            model=model,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,  # 控制生成的文本的随机性，范围是0到1
+            top_p=top_p,  # 控制生成的多样性
+            frequency_penalty=0,  # 频率惩罚，减少重复的词
+            presence_penalty=0  # 出现惩罚，避免模型重复生成已经出现的内容
+        )
+        
+        outputs = [choice.text.strip() for choice in response.choices]
     else:
         if type(prompt) == str:
             response = client.completions.create(
@@ -401,8 +449,23 @@ SERVER_PRESETS = {
         "temperature": 0.0,
         "max_tokens": 4096,
     },
+    "pandas-completion": {
+        "model_name": "llama-3.1-405b",
+        "temperature": 0.0,
+        "max_tokens": 4096,
+    },
     "volcengine": {
         "model_name": "Deepseek-r1",
+        "temperature": 0.0,
+        "max_tokens": 8192,
+    },
+    "volcengine-completion": {
+        "model_name": "Deepseek-r1",
+        "temperature": 0.0,
+        "max_tokens": 8192,
+    },
+    "siliconflow": {
+        "model_name": "DeepSeek-R1-Distill-Llama-8B",
         "temperature": 0.0,
         "max_tokens": 8192,
     },

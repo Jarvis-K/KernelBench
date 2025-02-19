@@ -335,27 +335,26 @@ def eval_kernel_against_ref(
     Model, get_init_inputs, get_inputs = load_original_model_and_inputs(
         original_model_src, context
     )
-    set_seed(seed_num)  # set seed for reproducible input
-    init_inputs = get_init_inputs()
-    init_inputs = [
-        x.cuda(device=device) if isinstance(x, torch.Tensor) else x for x in init_inputs
-    ]
-
-    with torch.no_grad():
-        set_seed(seed_num)  # set seed for reproducible weights
-        original_model = Model(*init_inputs)
-        assert hasattr(original_model, "forward")
-        if verbose:
-            print("[Eval] Original Model Loaded")
-    if verbose:
-        print("[Eval] Loading and Compiling New Model with Custom CUDA Kernel")
-
     metadata = {}  # for storing result metadata
     metadata["hardware"] = torch.cuda.get_device_name(device=device)
     metadata["device"] = str(device)  # for debugging
-
-    # this is where compilation happens
+    
     try:
+        set_seed(seed_num)  # set seed for reproducible input
+        init_inputs = get_init_inputs()
+        init_inputs = [
+            x.cuda(device=device) if isinstance(x, torch.Tensor) else x for x in init_inputs
+        ]
+
+        with torch.no_grad():
+            set_seed(seed_num)  # set seed for reproducible weights
+            original_model = Model(*init_inputs)
+            assert hasattr(original_model, "forward")
+            if verbose:
+                print("[Eval] Original Model Loaded")
+        if verbose:
+            print("[Eval] Loading and Compiling New Model with Custom CUDA Kernel")
+
         os.environ["TORCH_USE_CUDA_DSA"] = "1"  # compile with device side assertion
         # add hash for later to distinguish between multi-turn kernels
         ModelNew = load_custom_model(custom_model_src, context, build_dir)
@@ -372,11 +371,19 @@ def eval_kernel_against_ref(
             print(
                 f"[Eval] Lock file error during compilation, Please retry. Error: {e}"
             )
-            graceful_eval_cleanup(context, device)
-            return None
+            try:
+                graceful_eval_cleanup(context, device)
+            except:
+                pass
+            return KernelExecResult(
+                compiled=False, metadata=metadata
+            )
         else:
             metadata["compilation_error"] = str(e)
-            graceful_eval_cleanup(context, device)
+            try:
+                graceful_eval_cleanup(context, device)
+            except:
+                pass
             return KernelExecResult(
                 compiled=False, metadata=metadata
             )  # skip further steps
@@ -459,7 +466,7 @@ def eval_kernel_against_ref(
 
                 if verbose:
                     print(f"[Eval] Performance Stats: {runtime_stats}")
-                kernel_exec_result.runtime = runtime_stats["mean"]
+                kernel_exec_result.runtime = runtime_stats["median"]
                 kernel_exec_result.runtime_stats = runtime_stats
 
                 model = original_model.cuda(device=device)
@@ -476,10 +483,10 @@ def eval_kernel_against_ref(
 
                 if verbose:
                     print(f"[Eval] Baseline Performance Stats: {baseline_runtime_stats}")
-                kernel_exec_result.baseline_runtime = baseline_runtime_stats["mean"]
+                kernel_exec_result.baseline_runtime = baseline_runtime_stats["median"]
                 kernel_exec_result.baseline_runtime_stats = baseline_runtime_stats
 
-                kernel_exec_result.speed_up = kernel_exec_result.baseline_runtime / kernel_exec_result.runtime
+                kernel_exec_result.speed_up = max(0.0, kernel_exec_result.baseline_runtime / kernel_exec_result.runtime)
         except Exception as e:
             if verbose:
                 print(f"[Eval] Error in Measuring Performance: {e}")
@@ -782,6 +789,7 @@ def get_timing_stats(elapsed_times: list[float], device: torch.device = None) ->
         "min": float(f"{np.min(elapsed_times):.3g}"),
         "max": float(f"{np.max(elapsed_times):.3g}"),
         "num_trials": len(elapsed_times),
+        "median": float(f"{np.median(elapsed_times):.3g}"),
     }
 
     if device:
