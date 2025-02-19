@@ -98,8 +98,9 @@ class KernelAgent:
                 hist_results = self.results[-self.config.hist_num:]
                 improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=self.config.example_flag)
             else:
-                hist_codes = [self.best_code]
-                hist_results = [self.best_result]
+                sort_idx = sorted(range(len(self.results)), key=lambda x: self.results[x]['speed_up'])
+                hist_codes = [self.codes[i] for i in sort_idx][-self.config.hist_num:]
+                hist_results = [self.results[i] for i in sort_idx][-self.config.hist_num:]
                 improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=self.config.example_flag)
         else:
             improvement_prompt = prompt_generate_custom_cuda_from_prompt_template(self.ref_arch_src)

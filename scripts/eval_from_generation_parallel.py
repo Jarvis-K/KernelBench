@@ -10,6 +10,8 @@ from src import eval, utils
 import torch
 import os
 import multiprocessing as mp
+import concurrent.futures
+import logging
 
 
 from datasets import load_dataset
@@ -51,6 +53,7 @@ class EvalConfig(Config):
 
         # subset of problems to evaluate
         self.subset = (None, None) # (problem_id, problem_name), these are the logical index
+        # self.subset = (1, 10) # (problem_id, problem_name), these are the physical index
 
         # Evaluation
         # local (requires a GPU), modal (cloud GPU) coming soon
@@ -78,6 +81,7 @@ class EvalConfig(Config):
         self.num_perf_trials = 100
         self.timeout = 180 # in seconds
         self.measure_performance = True
+        self.num_workers = 1
 
         
         # number of GPUs to do batch evaluation
@@ -221,12 +225,57 @@ def remove_cache_dir(cache_dir: str, run_name: str, model_name: str, problem_id,
     """
     problem_cache_dir = os.path.join(cache_dir, run_name, model_name, f"{problem_id}", f"{sample_id}")
     print(f"cache_dir to remove: {problem_cache_dir}")
-    if os.path.exists(cache_dir):
+    if os.path.exists(problem_cache_dir):
         try:
-            shutil.rmtree(cache_dir, ignore_errors=True)
+            shutil.rmtree(problem_cache_dir, ignore_errors=True)
             print(f"\n[INFO] Removed cached folder for Problem ID: {problem_id}, Sample ID: {sample_id}")
         except Exception as e:
-            print(f"\n[WARNING] Failed to remove cache directory {cache_dir}: {str(e)}")
+            print(f"\n[WARNING] Failed to remove cache directory {problem_cache_dir}: {str(e)}")
+
+def compile_kernel(problem_id, sample_id, config, run_dir):
+    try:
+        kernel_src = fetch_kernel_from_disk(run_dir, config.level, problem_id, sample_id)
+        build_dir = os.path.join(config.kernel_eval_build_dir, config.run_name, config.model_name, f"{problem_id}", f"{sample_id}")
+        success, stdout, error = build_compile_cache(kernel_src, config.verbose, build_dir)
+        if success:
+            logging.info(f"Compiled kernel for Problem ID: {problem_id}, Sample ID: {sample_id}")
+            return (problem_id, sample_id)
+        else:
+            logging.error(f"Compilation FAILED for Problem ID: {problem_id}, Sample ID: {sample_id}: {error}")
+            remove_cache_dir(config.kernel_eval_build_dir, config.run_name, config.model_name, problem_id, sample_id)
+            return None
+    except Exception as e:
+        logging.error(f"Exception during compilation for Problem ID: {problem_id}, Sample ID: {sample_id}: {e}")
+        remove_cache_dir(config.kernel_eval_build_dir, config.run_name, config.model_name, problem_id, sample_id)
+        return None
+
+def compile_kernel_wrapper(args):
+    problem_id, sample_id, config, run_dir = args
+    try:
+        return compile_kernel(problem_id, sample_id, config, run_dir)
+    except Exception as e:
+        logging.error(f"Error compiling kernel for Problem ID: {problem_id}, Sample ID: {sample_id}: {e}")
+        return None
+
+def compile_all_kernels(total_work, config: EvalConfig, curr_level_dataset, run_dir: str) -> list[tuple[int, int]]:
+    """
+    Compile all kernels in parallel before evaluation using a single GPU
+    Returns a list of successfully compiled kernels
+    """
+    successful_compilations = []
+
+    with mp.Pool(processes=config.num_workers) as pool:
+        async_results = [
+            pool.apply_async(compile_kernel_wrapper, ((problem_id, sample_id, config, run_dir),))
+            for problem_id, sample_id in total_work
+        ]
+
+        for async_result in tqdm(async_results, total=len(total_work), desc="Compiling Kernels"):
+            result = async_result.get()
+            if result is not None:
+                successful_compilations.append(result)
+
+    return successful_compilations
 
 def batch_eval(
     total_work: list[tuple[int, int]],
@@ -240,19 +289,20 @@ def batch_eval(
     We put in time out for each batch, consider trying again with larger time out if it didn't finish building.
     Cache directory is removed if evaluation times out or fails
     """
-    # Compile all kernels first
-    compile_all_kernels(total_work, config, curr_level_dataset, run_dir)
+    # Compile all kernels first and get the list of successfully compiled kernels
+    successful_work = compile_all_kernels(total_work, config, curr_level_dataset, run_dir)
 
+    # import pdb; pdb.set_trace()
     # construct a list of work args
     batch_size = config.num_gpu_devices
 
-    with tqdm(total=len(total_work), desc="Processing batches") as pbar:
+    with tqdm(total=len(successful_work), desc="Processing batches") as pbar:
 
-        while len(total_work) > 0:
-            curr_work_batch = total_work[:batch_size]
-            total_work = total_work[batch_size:]  # pop the first batch_size elements
+        while len(successful_work) > 0:
+            curr_work_batch = successful_work[:batch_size]
+            successful_work = successful_work[batch_size:]  # pop the first batch_size elements
             print(
-                f"[Curr Batch] {len(curr_work_batch)} tasks over {config.num_gpu_devices} GPUs; [Total Work left] {len(total_work)}"
+                f"[Curr Batch] {len(curr_work_batch)} tasks over {config.num_gpu_devices} GPUs; [Total Work left] {len(successful_work)}"
             )
             assert len(curr_work_batch) <= batch_size, f"Current batch size {len(curr_work_batch)} is greater than the number of GPUs {batch_size}"
 
@@ -380,8 +430,6 @@ def single_eval_example(config: EvalConfig, curr_level_dataset: list[str], run_d
     print(example_eval_result)
     if not check_if_eval_exists_local(1, 0, eval_file_path):
         add_to_eval_results_file(1, 0, example_eval_result, eval_file_path)
-
-
 
 @pydra.main(base=EvalConfig)
 def main(config: EvalConfig):

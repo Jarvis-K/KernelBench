@@ -183,6 +183,14 @@ def query_server(
                 max_retries=3,
             )
             model = model_name
+        case "siliconflow-completion":
+            client = OpenAI(
+                api_key=SILICONFLOW_API_KEY,
+                base_url="https://api.siliconflow.cn/v1",
+                timeout=10000000,
+                max_retries=3,
+            )
+            model = model_name
         case "pandas-completion":
             client = OpenAI(
                 api_key=PANDAS_API_KEY,
@@ -465,6 +473,11 @@ SERVER_PRESETS = {
         "max_tokens": 8192,
     },
     "siliconflow": {
+        "model_name": "DeepSeek-R1-Distill-Llama-8B",
+        "temperature": 0.0,
+        "max_tokens": 8192,
+    },
+    "siliconflow-completion": {
         "model_name": "DeepSeek-R1-Distill-Llama-8B",
         "temperature": 0.0,
         "max_tokens": 8192,

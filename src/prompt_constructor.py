@@ -29,7 +29,7 @@ def parser_result(result, round=None, wait_flag=False):
             s += f"and the execution result of code is correct. "
             s += f"The average runtime of custom cuda code is {result['runtime']}ms, and the original torch code is {result['baseline_runtime']}ms, the speed up is {result['speed_up']}. "
         else:
-            s += f"but the execution result of the code is incorrect. The error is: {str(result['metadata'])[:200]}..."
+            s += f"but the execution result of the code is incorrect. The error is: {str(result['metadata'])[:500]}..."
     return s
 
 def get_arch_definition_from_file(arch_path):
@@ -48,14 +48,16 @@ def get_arch_definition(arch_src):
 ############################################
 # CUDA Prompt
 ############################################
-PROBLEM_STATEMENT = """You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups. \n
-    You have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.\n
+# PROBLEM_STATEMENT = """You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups. \n
+#     You have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.\n
+# """
+PROBLEM_STATEMENT = """You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups. \nYou are only limited by your imagination.\n
 """
 # PROBLEM_INSTRUCTION = """
 # Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! \n
 # """
 PROBLEM_INSTRUCTION = """
-Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional.\n
+Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional.
 """
 
 
@@ -110,12 +112,11 @@ def prompt_generate_custom_cuda_reflection(
     """
     if hist_results:
         if best_hist_flag:
-            result = hist_results[-1]
-            response = hist_responses[-1]
-
-            improvement_prompt = f"Below is the best generated CUDA kernel code:\n"
-            improvement_prompt += f"```\n{response}\n```"
-            improvement_prompt += f"\n{parser_result(result)}\n\n"
+            improvement_prompt = f"Below is the previously generated CUDA kernel code:\n"
+            for i, (response, result) in enumerate(zip(hist_responses, hist_results)):
+                improvement_prompt += f"Round {i+1}:\n"
+                improvement_prompt += f"```\n{response}\n```"
+                improvement_prompt += f"\n{parser_result(result, round=i+1)}\n\n"
         elif recent_hist_flag:
             result = hist_results[-1]
             response = hist_responses[-1]
@@ -131,13 +132,15 @@ def prompt_generate_custom_cuda_reflection(
 
         prompt += improvement_prompt
     prompt += PROBLEM_INSTRUCTION
+    if hist_results:
+        prompt += "Please generate the best CUDA kernel code for the given architecture based on the previous generations with feedbacks and the differences and optimizations between the previously generated codes."
 
     return prompt
 
 def prompt_generate_custom_cuda_s1(
     arc_src, example_arch_src, example_new_arch_src, hist_responses, hist_results, wait_responses, wait_results, model
 ):
-    prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>" if 'llama' in model else ""
+    prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>" if 'llama' in model or 'Llama' in model else ""
     prompt += PROBLEM_STATEMENT
 
     if example_arch_src != "" and example_new_arch_src != "":
@@ -168,8 +171,8 @@ def prompt_generate_custom_cuda_s1(
         prompt += improvement_prompt
 
     prompt += """
-Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional.\n"""
-    end_token = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>" if "llama" in model else "" 
+Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Here's the code:\n"""
+    end_token = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>" if "llama" in model or "Llama" in model else "" 
     prompt += end_token
     if wait_responses:
         # prompt += "Below is the CUDA kernel code I've generated and optimized for you:\n"
