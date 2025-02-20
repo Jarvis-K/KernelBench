@@ -3,11 +3,16 @@ from pydra import REQUIRED, Config
 import os, sys
 import torch
 import json
+import concurrent.futures
+import multiprocessing as mp
+import logging
+import shutil
+from tqdm import tqdm
 
 from datasets import load_dataset
 
 from src.dataset import construct_kernelbench_dataset
-from src.eval import eval_kernel_against_ref
+from src.eval import eval_kernel_against_ref, build_compile_cache
 from src.prompt_constructor import prompt_generate_custom_cuda_from_prompt_template, prompt_generate_custom_cuda_from_prompt_template_reflection
 from src.utils import extract_first_code, query_server, set_gpu_arch, read_file, create_inference_server_from_presets
 
@@ -19,6 +24,8 @@ Easiest way to get started, to test a single problem for experimentation or debu
 REPO_TOP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 torch.set_printoptions(precision=4, threshold=10)
+inference_server = None
+global_config = None
 
 class EvalConfig(Config):
     def __init__(self):
@@ -53,15 +60,78 @@ class EvalConfig(Config):
         self.device_id = 0
         self.reflection = True
         # Logging
-        self.logdir = os.path.join(REPO_TOP_DIR, "results/eval_logs")
+        self.logdir = os.path.join(REPO_TOP_DIR, "results/eval_logs/plan")
+        self.kernel_eval_build_dir = os.path.join(REPO_TOP_DIR, "cache")
         self.verbose = False
         self.recent_hist_flag = False
         self.best_hist_flag = False
         self.example_flag = False
+        self.plan_flag = True
         self.hist_num = 5
+        self.sample_num = 10
 
     def __repr__(self):
         return f"EvalConfig({self.to_dict()})"
+
+def remove_cache_dir(cache_dir: str, model_name: str, iteration_num, sample_id, config: EvalConfig):
+    """
+    Remove the cached folder for sample compilation so it can start a clean build next time
+    useful for time out, failed build, etc.
+    """
+    problem_cache_dir = os.path.join(cache_dir, "eval_single_sample", model_name, f"{config.problem_id}", f"{iteration_num}", f"{sample_id}")
+    print(f"cache_dir to remove: {problem_cache_dir}")
+    if os.path.exists(problem_cache_dir):
+        try:
+            shutil.rmtree(problem_cache_dir, ignore_errors=True)
+            print(f"\n[INFO] Removed cached folder for Iteration {iteration_num}, Sample ID: {sample_id}")
+        except Exception as e:
+            print(f"\n[WARNING] Failed to remove cache directory {problem_cache_dir}: {str(e)}")
+
+def compile_kernel(prompt, iteration_num, sample_id):
+    try:
+        build_dir = os.path.join(global_config.kernel_eval_build_dir, "eval_single_sample", global_config.model_name, f"{global_config.problem_id}", f"{iteration_num}", f"{sample_id}")
+        response = inference_server(prompt)
+        kernel_src = extract_first_code(response, ["python", "cpp"])
+        success, stdout, error = build_compile_cache(kernel_src, global_config.verbose, build_dir)
+        if success:
+            logging.info(f"Compiled kernel for Iteration {iteration_num}, Sample ID: {sample_id}")
+            return (iteration_num, sample_id, response, kernel_src)
+        else:
+            logging.error(f"Compilation FAILED for Iteration {iteration_num}, Sample ID: {sample_id}: {error}")
+            remove_cache_dir(global_config.kernel_eval_build_dir, global_config.model_name, iteration_num, sample_id, global_config)
+            return None
+    except Exception as e:
+        logging.error(f"Exception during compilation for Iteration {iteration_num}, Sample ID: {sample_id}: {e}")
+        remove_cache_dir(global_config.kernel_eval_build_dir, global_config.model_name, iteration_num, sample_id, global_config)
+        return None
+
+def compile_kernel_wrapper(args):
+    prompt, iteration_num, sample_id = args
+    try:
+        return compile_kernel(prompt, iteration_num, sample_id)
+    except Exception as e:
+        logging.error(f"Error compiling kernel for Iteration {iteration_num}, Sample ID: {sample_id}: {e}")
+        return None
+
+def compile_all_kernels(prompt, iteration_num) -> list[tuple[int, int]]:
+    """
+    Compile all kernels in parallel before evaluation using a single GPU
+    Returns a list of successfully compiled kernels
+    """
+    successful_compilations = []
+
+    with mp.Pool(processes=global_config.sample_num) as pool:
+        async_results = [
+            pool.apply_async(compile_kernel_wrapper, ((prompt, iteration_num, sample_id),))
+            for sample_id in range(global_config.sample_num)
+        ]
+
+        for async_result in tqdm(async_results, total=global_config.sample_num, desc="Compiling Kernels"):
+            result = async_result.get()
+            if result is not None:
+                successful_compilations.append(result)
+
+    return successful_compilations
 
 class KernelAgent:
     def __init__(self, config: EvalConfig):
@@ -69,6 +139,7 @@ class KernelAgent:
         self.init_prompt = None
         self.current_prompt = None
         self.ref_arch_src = None
+        self.plan = ""
 
         self.prompts = []
         self.responses = []
@@ -82,9 +153,13 @@ class KernelAgent:
 
         self.iteration_num = 0
         self.output_dir = os.path.join(self.config.logdir, self.config.model_name, f"level_{self.config.level}", f"problem_{self.config.problem_id}")
+        self.num_inferences = 3  # 新增：每次迭代生成的推理次数
 
     def initialize_server(self, inference_server):
         self.inference_server = inference_server
+    
+    def initialize_plan_server(self, plan_server):
+        self.plan_server = plan_server
 
     def initialize_prompt(self, prompt):
         self.init_prompt = prompt
@@ -92,44 +167,65 @@ class KernelAgent:
         self.prompts.append(prompt)
 
     def refine_prompt(self):
+        first_step_flag = True if self.iteration_num == 0 else False
+        example_flag = True if self.iteration_num == 0 else self.config.example_flag
+        if self.config.plan_flag and not first_step_flag:
+            plan_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=True)
+            self.plan = self.plan_server(plan_prompt)
+
         if self.config.reflection:
             if not self.config.best_hist_flag:
                 hist_codes = self.codes[-self.config.hist_num:]
                 hist_results = self.results[-self.config.hist_num:]
-                improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=self.config.example_flag)
+                improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan)
             else:
                 sort_idx = sorted(range(len(self.results)), key=lambda x: self.results[x]['speed_up'])
                 hist_codes = [self.codes[i] for i in sort_idx][-self.config.hist_num:]
                 hist_results = [self.results[i] for i in sort_idx][-self.config.hist_num:]
-                improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=self.config.example_flag)
+                improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan)
         else:
             improvement_prompt = prompt_generate_custom_cuda_from_prompt_template(self.ref_arch_src)
 
         self.current_prompt = improvement_prompt
         self.prompts.append(self.current_prompt)
 
+    def get_code_and_compile(self):
+        compile_results = compile_all_kernels(self.current_prompt, self.iteration_num)
+        # import pdb; pdb.set_trace()
+        results = []
+        for problem_id, sample_id, response, code in compile_results:
+            result = eval_kernel_against_ref(
+                self.ref_arch_src,
+                code,
+                verbose=self.config.verbose,
+                measure_performance=True,
+                num_correct_trials=5,
+                num_perf_trials=100,
+                device = torch.device(f"cuda:{self.config.device_id}"),
+                build_dir=os.path.join(self.config.kernel_eval_build_dir, "eval_single_sample", self.config.model_name, f"{self.config.problem_id}", f"{self.iteration_num}", f"{sample_id}")
+            )
+            result = vars(result)
+            result['iteration'] = self.iteration_num
+            result['sample_id'] = sample_id
+            results.append(result)
+            self.save_results_single_sample(code, response, result, sample_id)
+        
+        result_idxs = range(len(results))
+        if len(result_idxs) == 0:
+            return {}, "", ""
+        min_runtime_idx = min(result_idxs, key=lambda x: results[x]['runtime'] if results[x]['correctness'] else float('inf'))
+        import pdb; pdb.set_trace()
+        result = results[min_runtime_idx]
+        code = compile_results[min_runtime_idx][2]
+        response = compile_results[min_runtime_idx][3]
+        return result, code, response
+
     def get_results(self, ref_arch_src, num_correct_trials=5, num_perf_trials=100, verbose=False):
-        # 调用推理服务器生成响应
-        response = self.inference_server(self.current_prompt)
-        # 提取首个代码块（指定语言：python 或 cpp）
-        self.responses.append(response)
-        code = extract_first_code(response, ["python", "cpp"])
-        # 确保生成了有效的代码
-        assert code is not None, f"Custom CUDA code generation failed in iteration {self.iteration_num}"
-        self.codes.append(code)
-        # 评估生成的 CUDA 代码
-        result = eval_kernel_against_ref(
-            ref_arch_src,
-            code,
-            verbose=verbose,
-            measure_performance=True,
-            num_correct_trials=num_correct_trials,
-            num_perf_trials=num_perf_trials,
-            device = torch.device(f"cuda:{self.config.device_id}")
-        )
-        result = vars(result)
-        result['iteration'] = self.iteration_num
+        result, code, response = self.get_code_and_compile()
         self.results.append(result)
+        self.responses.append(response)
+        self.codes.append(code)
+        self.prompts.append(self.current_prompt)
 
         if self.best_result is None:
             self.best_prompt = self.current_prompt
@@ -167,38 +263,60 @@ class KernelAgent:
                 self.results[i]["speed_up"] = max(min_baseline_runtime / result["runtime"], 0.0)
                 self.save_results(i)
 
-    def save_results(self, iteration_num=0):
-        # 保存当前迭代的 prompt、response 和 result 到指定目录
+    def save_results_single_sample(self, code, response, result, sample_id=0):
         os.makedirs(self.output_dir, exist_ok=True)
         
-        iteration_dir = os.path.join(self.output_dir, f"iteration_{iteration_num}")
+        iteration_dir = os.path.join(self.output_dir, f"iteration_{self.iteration_num}") 
+        os.makedirs(iteration_dir, exist_ok=True)
+        with open(os.path.join(iteration_dir, f"kernel_code_{sample_id}.py"), "w") as f:
+            f.write(code)
+        with open(os.path.join(iteration_dir, f"response_{sample_id}.text"), "w") as f:
+            f.write(response)
+        
+        if os.path.exists(os.path.join(iteration_dir, f"result_all.json")):
+            with open(os.path.join(iteration_dir, f"result_all.json"), "r") as f:
+                result_all = json.load(f)
+        else:
+            result_all = []
+        result_all.append(result)
+        with open(os.path.join(iteration_dir, f"result_all.json"), "w") as f:
+            json.dump(result_all, f, indent=4)
+
+    def save_results(self, iteration_num=0):
+        # 保存多个推理结果
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        iteration_dir = os.path.join(self.output_dir, f"iteration_{iteration_num}") 
         os.makedirs(iteration_dir, exist_ok=True)
 
-        with open(os.path.join(iteration_dir, "prompt.txt"), "w") as f:
-            f.write(self.prompts[iteration_num])
-        with open(os.path.join(iteration_dir, "response.txt"), "w") as f:
-            f.write(self.responses[iteration_num])
-        with open(os.path.join(iteration_dir, "result.json"), "w") as f:
-            json.dump(self.results[iteration_num], f, indent=4)
-        with open(os.path.join(iteration_dir, "kernel_code.py"), "w") as f:
-            f.write(self.codes[iteration_num])
-        
-        # 汇总所有迭代的评估结果到一个 JSON 文件中
+        for idx, (prompt, response, result, code) in enumerate(zip(self.prompts, self.responses, self.results, self.codes)):
+            with open(os.path.join(iteration_dir, f"prompt.txt"), "w") as f:
+                f.write(prompt)
+            with open(os.path.join(iteration_dir, f"response.py"), "w") as f:
+                f.write(response)
+            with open(os.path.join(iteration_dir, f"kernel_code.py"), "w") as f:
+                f.write(code)
+            with open(os.path.join(iteration_dir, f"result.json"), "w") as f:
+                json.dump(result, f, indent=4)
+
+        # 保存汇总结果
         eval_results_path = os.path.join(self.output_dir, "eval_results.json")
         with open(eval_results_path, "w") as f:
             json.dump(self.results, f, indent=4)
         
-        # 保存最佳结果到专门的文件夹中
-        best_dir = os.path.join(self.output_dir, "best_results")
-        os.makedirs(best_dir, exist_ok=True)
-        with open(os.path.join(best_dir, "best_prompt.txt"), "w") as f:
-            f.write(self.best_prompt)
-        with open(os.path.join(best_dir, "best_response.txt"), "w") as f:
-            f.write(self.best_response)
-        with open(os.path.join(best_dir, "best_result.json"), "w") as f:
-            json.dump(self.best_result, f, indent=4)
-        with open(os.path.join(best_dir, "best_code.py"), "w") as f:
-            f.write(self.best_code)
+    def save_best_results(self):
+        # 保存最佳结果
+        if self.best_result:
+            best_dir = os.path.join(self.output_dir, "best_results")
+            os.makedirs(best_dir, exist_ok=True)
+            with open(os.path.join(best_dir, "best_prompt.txt"), "w") as f:
+                f.write(self.best_prompt)
+            with open(os.path.join(best_dir, "best_response.py"), "w") as f:
+                f.write(self.best_response)
+            with open(os.path.join(best_dir, "best_result.json"), "w") as f:
+                json.dump(self.best_result, f, indent=4)
+            with open(os.path.join(best_dir, "best_code.py"), "w") as f:
+                f.write(self.best_code)
 
     def draw_results(self):
         import matplotlib.pyplot as plt
@@ -224,7 +342,8 @@ def main(config: EvalConfig):
     迭代生成并评估 CUDA 核函数，最终输出最佳结果
     """
     print(f"Starting Eval with config: {config}")
-    
+    global inference_server, global_config
+    global_config = config
 
     # 配置数据集
     if config.dataset_src == "huggingface":
@@ -273,11 +392,20 @@ def main(config: EvalConfig):
         archon_config_path=config.archon_config_path,
         time_generation=True
     )
+    plan_server = create_inference_server_from_presets(
+        # server_type="volcengine",
+        # model_name="ep-20250214154957-c777d",
+        server_type="pandas",
+        model_name="gpt-4o-mini",
+        temperature=1.0,
+        max_tokens=8192,
+        verbose=False,
+    )
     kernel_agent.initialize_server(inference_server)
+    kernel_agent.initialize_plan_server(plan_server)
     kernel_agent.ref_arch_src = ref_arch_src
 
-    custom_cuda_prompt = prompt_generate_custom_cuda_from_prompt_template(ref_arch_src) if not config.reflection else prompt_generate_custom_cuda_from_prompt_template_reflection(ref_arch_src, example_flag=True)
-    kernel_agent.initialize_prompt(custom_cuda_prompt)
+    kernel_agent.refine_prompt()
 
     # 3. 迭代生成和评估
     for i in range(config.max_iteration):
@@ -291,6 +419,7 @@ def main(config: EvalConfig):
             kernel_agent.refine_prompt()
 
     kernel_agent.update_speedup()
+    kernel_agent.save_best_results()
 
     # print(f"Best prompt:\n{kernel_agent.best_prompt}")
     # print(f"Best response:\n{kernel_agent.best_response}")
@@ -301,6 +430,8 @@ def main(config: EvalConfig):
         print(f"There's a huge improvement in problem {config.problem_id}!")
     else:
         print(f"No huge improvement~")
+
+    shutil.rmtree(config.kernel_eval_build_dir, ignore_errors=True)
 
 if __name__ == "__main__":
     main()

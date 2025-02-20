@@ -584,7 +584,17 @@ def extract_first_code(output_string: str, code_language_types: list[str]) -> st
             if code.startswith(code_type):
                 code = code[len(code_type) :].strip()
 
-        return code
+        module_name = re.search(r"name=\"(.*?)\",", code, re.DOTALL)
+        
+        if module_name:
+            module_name = module_name.group(1).strip()
+            # 随机生成16位字符串
+            import string
+            modify_module_name = module_name + "_" + ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+            code = code.replace(f'name="{module_name}",', f'name="{modify_module_name}",')
+            return code
+        else:
+            return code
 
     return None
 

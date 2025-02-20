@@ -48,17 +48,16 @@ def get_arch_definition(arch_src):
 ############################################
 # CUDA Prompt
 ############################################
-# PROBLEM_STATEMENT = """You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups. \n
+# PROBLEM_STATEMENT = """You are an expert in CUDA programming and performance optimization. You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups. \n
 #     You have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.\n
 # """
-PROBLEM_STATEMENT = """You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups. \nYou are only limited by your imagination.\n
+PROBLEM_STATEMENT = """You are an expert in CUDA programming and performance optimization. Please write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups. \nYou are only limited by your imagination.\n
 """
 # PROBLEM_INSTRUCTION = """
 # Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! \n
 # """
 PROBLEM_INSTRUCTION = """
-Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional.
-"""
+Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional."""
 
 
 def prompt_generate_custom_cuda(
@@ -88,7 +87,7 @@ def prompt_generate_custom_cuda(
     return prompt
 
 def prompt_generate_custom_cuda_reflection(
-    arc_src, example_arch_src, example_new_arch_src, hist_responses, hist_results, recent_hist_flag, best_hist_flag
+    arc_src, example_arch_src, example_new_arch_src, hist_responses, hist_results, recent_hist_flag, best_hist_flag, plan_flag=False, first_step_flag=True, generate_plan_flag=False, plan=None
 ):
     prompt = PROBLEM_STATEMENT
 
@@ -131,10 +130,28 @@ def prompt_generate_custom_cuda_reflection(
                 improvement_prompt += f"\n{parser_result(result, round=i+1)}\n\n"
 
         prompt += improvement_prompt
-    prompt += PROBLEM_INSTRUCTION
-    if hist_results:
-        prompt += "Please generate the best CUDA kernel code for the given architecture based on the previous generations with feedbacks and the differences and optimizations between the previously generated codes."
-
+    
+    if not plan_flag:
+        prompt += PROBLEM_INSTRUCTION
+        if hist_results:
+            prompt += "Please generate the best CUDA kernel code for the given architecture based on the previous generations with feedbacks and the differences and optimizations between the previously generated codes."
+    else:
+        if generate_plan_flag:
+            if first_step_flag:
+                # prompt += "Please generate a short, general and brief generation policy of the custom CUDA kernel for the given architecture. There's no need to generate the code."
+                pass
+            else:
+                prompt += "Given the above CUDA codes and corresponding feedbacks, analyze it thoroughly for any potential errors or inefficiencies. Suggest up to 3 key optimizations that would significantly improve the code's performance. Additionally, if you detect any bugs, incorrect logic, or common issues (e.g., memory access violations, race conditions, inefficient thread/block configurations), identify and correct them. Focus on the most critical areas—such as memory usage, parallelism, thread management, kernel optimization, or other relevant factors specific to this code. Prioritize actionable changes that will have the highest impact on speed and efficiency. Provide clear, actionable recommendations and a brief explanation for each recommendation, indicating both why the optimization would improve performance and how any errors were corrected. There's no need to output the complete code, just the optimization directions."
+        else:
+            if first_step_flag:
+                # prompt += "Here is the generation policy for the given architecture:\n"
+                # prompt += plan
+                prompt += PROBLEM_INSTRUCTION
+            else:
+                # prompt += "Here is the optimization directions for the given architecture and the previous generations with feedbacks:\n"
+                prompt += plan
+                prompt += "Using the optimization directions and error corrections, rewrite the CUDA code to implement the suggested improvements. Ensure that any errors identified in the original code are fixed, and the optimizations are applied for better performance. Maintain the architecture's original functionality while ensuring it is error-free, runs faster, and is more efficient. Please output the complete code in a code block, not just the CUDA code."
+            
     return prompt
 
 def prompt_generate_custom_cuda_s1(
@@ -448,7 +465,7 @@ def prompt_generate_custom_cuda_from_prompt_template(ref_arch_src: str) -> str:
 
     return prompt_generate_custom_cuda(arch, example_arch, example_new_arch)
 
-def prompt_generate_custom_cuda_from_prompt_template_reflection(ref_arch_src: str, hist_responses=None, hist_results=None, recent_hist_flag=False, best_hist_flag=False, example_flag=True) -> str:
+def prompt_generate_custom_cuda_from_prompt_template_reflection(ref_arch_src: str, hist_responses=None, hist_results=None, recent_hist_flag=False, best_hist_flag=False, example_flag=True, plan_flag=False, first_step_flag=True, generate_plan_flag=False, plan=None) -> str:
     """
     Using prompt example (an element-wise addition) for prompt templates
     The most basic form of example just to show LLM the task and the expected output format
@@ -476,7 +493,7 @@ def prompt_generate_custom_cuda_from_prompt_template_reflection(ref_arch_src: st
     example_arch = read_file(example_arch_path) if example_flag else ""
     example_new_arch = read_file(example_new_arch_path) if example_flag else ""
 
-    return prompt_generate_custom_cuda_reflection(arch, example_arch, example_new_arch, hist_responses, hist_results, recent_hist_flag, best_hist_flag)
+    return prompt_generate_custom_cuda_reflection(arch, example_arch, example_new_arch, hist_responses, hist_results, recent_hist_flag, best_hist_flag, plan_flag, first_step_flag, generate_plan_flag, plan)
 
 def prompt_generate_custom_cuda_from_prompt_template_s1(ref_arch_src: str, hist_responses=None, hist_results=None, example_flag=True, wait_responses=None, wait_results=None, model="llama") -> str:
     """
