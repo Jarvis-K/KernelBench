@@ -214,10 +214,9 @@ class KernelAgent:
         if len(result_idxs) == 0:
             return {}, "", ""
         min_runtime_idx = min(result_idxs, key=lambda x: results[x]['runtime'] if results[x]['correctness'] else float('inf'))
-        import pdb; pdb.set_trace()
         result = results[min_runtime_idx]
-        code = compile_results[min_runtime_idx][2]
-        response = compile_results[min_runtime_idx][3]
+        code = compile_results[min_runtime_idx][3]
+        response = compile_results[min_runtime_idx][2]
         return result, code, response
 
     def get_results(self, ref_arch_src, num_correct_trials=5, num_perf_trials=100, verbose=False):
@@ -225,7 +224,6 @@ class KernelAgent:
         self.results.append(result)
         self.responses.append(response)
         self.codes.append(code)
-        self.prompts.append(self.current_prompt)
 
         if self.best_result is None:
             self.best_prompt = self.current_prompt
@@ -289,15 +287,14 @@ class KernelAgent:
         iteration_dir = os.path.join(self.output_dir, f"iteration_{iteration_num}") 
         os.makedirs(iteration_dir, exist_ok=True)
 
-        for idx, (prompt, response, result, code) in enumerate(zip(self.prompts, self.responses, self.results, self.codes)):
-            with open(os.path.join(iteration_dir, f"prompt.txt"), "w") as f:
-                f.write(prompt)
-            with open(os.path.join(iteration_dir, f"response.py"), "w") as f:
-                f.write(response)
-            with open(os.path.join(iteration_dir, f"kernel_code.py"), "w") as f:
-                f.write(code)
-            with open(os.path.join(iteration_dir, f"result.json"), "w") as f:
-                json.dump(result, f, indent=4)
+        with open(os.path.join(iteration_dir, "prompt.txt"), "w") as f:
+            f.write(self.prompts[iteration_num])
+        with open(os.path.join(iteration_dir, "response.txt"), "w") as f:
+            f.write(self.responses[iteration_num])
+        with open(os.path.join(iteration_dir, "result.json"), "w") as f:
+            json.dump(self.results[iteration_num], f, indent=4)
+        with open(os.path.join(iteration_dir, "kernel_code.py"), "w") as f:
+            f.write(self.codes[iteration_num])
 
         # 保存汇总结果
         eval_results_path = os.path.join(self.output_dir, "eval_results.json")
@@ -311,7 +308,7 @@ class KernelAgent:
             os.makedirs(best_dir, exist_ok=True)
             with open(os.path.join(best_dir, "best_prompt.txt"), "w") as f:
                 f.write(self.best_prompt)
-            with open(os.path.join(best_dir, "best_response.py"), "w") as f:
+            with open(os.path.join(best_dir, "best_response.txt"), "w") as f:
                 f.write(self.best_response)
             with open(os.path.join(best_dir, "best_result.json"), "w") as f:
                 json.dump(self.best_result, f, indent=4)
