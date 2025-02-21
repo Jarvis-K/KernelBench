@@ -83,6 +83,7 @@ def set_gpu_arch(arch_list: list[str]):
             raise ValueError(f"Invalid architecture: {arch}. Must be one of {valid_archs}")
     
     os.environ["TORCH_CUDA_ARCH_LIST"] = ";".join(arch_list)
+    # os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
 
 def query_server(
     prompt: str | list[dict],  # string if normal prompt, list of dicts if chat prompt,
@@ -588,6 +589,9 @@ def extract_first_code(output_string: str, code_language_types: list[str]) -> st
                 code = code[len(code_type) :].strip()
 
         module_name = re.search(r"name=\"(.*?)\",", code, re.DOTALL)
+
+        if "if __name__ ==" in code:
+            code = code.split("if __name__ ==")[0]
         
         if module_name:
             module_name = module_name.group(1).strip()

@@ -39,7 +39,7 @@ class EvalConfig(Config):
         self.eval_mode = "local"
         # Construct this from mapping from architecture name to torch cuda arch list in the future
         # you can either specify SM version or just use the name
-        self.gpu_arch = ["Ada"]
+        self.gpu_arch = ['Hopper']
 
         # Archon config
         self.archon_config_path = None
@@ -84,8 +84,8 @@ def main(config: EvalConfig):
     elif config.dataset_src == "local":
         curr_level_dataset = construct_kernelbench_dataset(config.level)
 
-    # if config.gpu_arch:
-    #     set_gpu_arch(config.gpu_arch)  # otherwise build for all architectures
+    if config.gpu_arch:
+        set_gpu_arch(config.gpu_arch)  # otherwise build for all architectures
 
     if config.log:
         os.makedirs(config.logdir, exist_ok=True)
