@@ -51,15 +51,33 @@ def get_arch_definition(arch_src):
 # PROBLEM_STATEMENT = """You are an expert in CUDA programming and performance optimization. You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups. \n
 #     You have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.\n
 # """
-PROBLEM_STATEMENT = """You are an expert in CUDA programming and performance optimization. Please write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups. \nYou are only limited by your imagination.\n
+PROBLEM_STATEMENT = """You are an expert in CUDA programming and performance optimization. Please write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups on H100 GPU. \nYou are only limited by your imagination.\n
 """
 # PROBLEM_INSTRUCTION = """
 # Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! \n
 # """
 PROBLEM_INSTRUCTION = """
-Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional."""
+Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional on the given GPU device. Just output the new model code, no other text, and NO testing code!"""
 
-
+H100_description = """
+Here's the information of H100 GPU: 
+- GPU Architecture: Hopper
+- GPU Memory: 80GB
+- Memory Bandwidth: 3.35 TB/s
+- FP64 TFLOPS: 34
+- FP64 Tensor Core TFLOPS: 67
+- FP32 TFLOPS: 67
+- TF32 Tensor Core TFLOPS: 989 with sparsity
+- BFLOAT16 Tensore Core TFLOPS: 1979 with sparsity
+- FP16 Tensor Core TFLOPS: 1979 with sparsity
+- FP8 Tensor Core TFLOPS: 3958 with sparsity
+- INT8 Tensor Core TOPS: 3958 with sparsity
+- Register File Size: 64K 32-bit registers per SM
+- Maximum number of registers per thread: 255
+- Maximum number of thread blocks per SM: 32
+- Shared memory capacity per SM: 228 KB
+- Maximum shared memory per thread block: 227 KB
+"""
 def prompt_generate_custom_cuda(
     arc_src: str, example_arch_src: str, example_new_arch_src: str
 ) -> str:
@@ -109,6 +127,11 @@ def prompt_generate_custom_cuda_reflection(
     {arc_src}
     ```
     """
+
+    prompt += f"""
+    Here's the information of H100 GPU: 
+    {H100_description}
+    """
     if hist_results:
         if best_hist_flag:
             improvement_prompt = f"Below is the previously generated CUDA kernel code:\n"
@@ -134,14 +157,14 @@ def prompt_generate_custom_cuda_reflection(
     if not plan_flag:
         prompt += PROBLEM_INSTRUCTION
         if hist_results:
-            prompt += "Please generate the best CUDA kernel code for the given architecture based on the previous generations with feedbacks and the differences and optimizations between the previously generated codes."
+            prompt += "Please generate the best CUDA kernel code for the given architecture based on the previous generations with feedbacks and the differences and optimizations between the previously generated codes. Please consider the hardware information of H100 GPU."
     else:
         if generate_plan_flag:
             if first_step_flag:
                 # prompt += "Please generate a short, general and brief generation policy of the custom CUDA kernel for the given architecture. There's no need to generate the code."
                 pass
             else:
-                prompt += "Given the above CUDA codes and corresponding feedbacks, analyze it thoroughly for any potential errors or inefficiencies. Suggest up to 3 key optimizations that would significantly improve the code's performance. Additionally, if you detect any bugs, incorrect logic, or common issues (e.g., memory access violations, race conditions, inefficient thread/block configurations), identify and correct them. Focus on the most critical areas—such as memory usage, parallelism, thread management, kernel optimization, or other relevant factors specific to this code. Prioritize actionable changes that will have the highest impact on speed and efficiency. Provide clear, actionable recommendations and a brief explanation for each recommendation, indicating both why the optimization would improve performance and how any errors were corrected. There's no need to output the complete code, just the optimization directions."
+                prompt += "Given the above CUDA codes and corresponding feedbacks, analyze it thoroughly for any potential errors or inefficiencies. Suggest up to 3 key optimizations that would significantly improve the code's performance. Additionally, if you detect any bugs, incorrect logic, or common issues (e.g., memory access violations, race conditions, inefficient thread/block configurations), identify and correct them. Focus on the most critical areas—such as memory usage, parallelism, thread management, kernel optimization, or other relevant factors specific to this code. Prioritize actionable changes that will have the highest impact on speed and efficiency. Provide clear, actionable recommendations and a brief explanation for each recommendation, indicating both why the optimization would improve performance and how any errors were corrected. There's no need to output the complete code, just the optimization directions. Please consider the hardware information of H100 GPU."
         else:
             if first_step_flag:
                 # prompt += "Here is the generation policy for the given architecture:\n"
@@ -150,7 +173,7 @@ def prompt_generate_custom_cuda_reflection(
             else:
                 # prompt += "Here is the optimization directions for the given architecture and the previous generations with feedbacks:\n"
                 prompt += plan
-                prompt += "Using the optimization directions and error corrections, rewrite the CUDA code to implement the suggested improvements. Ensure that any errors identified in the original code are fixed, and the optimizations are applied for better performance. Maintain the architecture's original functionality while ensuring it is error-free, runs faster, and is more efficient. Please output the complete code in a code block, not just the CUDA code."
+                prompt += "Using the optimization directions and error corrections, rewrite the CUDA code to implement the suggested improvements. Ensure that any errors identified in the original code are fixed, and the optimizations are applied for better performance. Maintain the architecture's original functionality while ensuring it is error-free, runs faster, and is more efficient. Please output the complete code in a code block, not just the CUDA code. Please consider the hardware information of H100 GPU."
             
     return prompt
 

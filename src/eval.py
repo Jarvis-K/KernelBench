@@ -89,6 +89,7 @@ class KernelExecResult(BaseModel):
     baseline_runtime: float = -1.0  # in us, only recorded if we decide to measure performance
     baseline_runtime_stats: dict = {}  # only recorded if we decide to measure performance
     speed_up: float = 0.0  # only recorded if we decide to measure performance
+    tokens: int = 0
 
 
 def load_original_model_and_inputs(
@@ -342,9 +343,7 @@ def eval_kernel_against_ref(
     try:
         set_seed(seed_num)  # set seed for reproducible input
         init_inputs = get_init_inputs()
-        init_inputs = [
-            x.cuda(device=device) if isinstance(x, torch.Tensor) else x for x in init_inputs
-        ]
+        init_inputs = [x.cuda(device=device) if isinstance(x, torch.Tensor) else x for x in init_inputs]
 
         with torch.no_grad():
             set_seed(seed_num)  # set seed for reproducible weights

@@ -468,7 +468,7 @@ def main(config: EvalConfig):
 
 
     # set GPU arch to configure what target to build for
-    set_gpu_arch(config.gpu_arch)
+    # set_gpu_arch(config.gpu_arch)
     assert config.num_gpu_devices <= torch.cuda.device_count(), f"Number of GPUs requested ({config.num_gpu_devices}) is greater than the number of available GPUs ({torch.cuda.device_count()})"
 
     # To Debug

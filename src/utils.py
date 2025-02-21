@@ -305,6 +305,7 @@ def query_server(
                 top_p=top_p,
             )
         outputs = [choice.message.content for choice in response.choices]
+        tokens = response.usage.total_tokens
     elif server_type == "together":
         response = client.chat.completions.create(
             model=model,
@@ -355,6 +356,7 @@ def query_server(
             max_tokens=max_tokens,
         )
         outputs = [choice.message.content for choice in response.choices]
+        tokens = response.usage.total_tokens
     elif server_type == "siliconflow":
         response = client.chat.completions.create(
                 model=model,
@@ -367,6 +369,7 @@ def query_server(
             max_tokens=max_tokens,
         )
         outputs = [choice.message.content for choice in response.choices]
+        tokens = response.usage.total_tokens
     elif "completion" in server_type:
         response = client.completions.create(
             model=model,
@@ -403,9 +406,9 @@ def query_server(
 
     # output processing
     if len(outputs) == 1:
-        return outputs[0]
+        return outputs[0], tokens
     else:
-        return outputs
+        return outputs, tokens
 
 
 # a list of presets for API server configs
@@ -591,10 +594,10 @@ def extract_first_code(output_string: str, code_language_types: list[str]) -> st
             # 随机生成16位字符串
             import string
             modify_module_name = module_name + "_" + ''.join(random.choices(string.ascii_letters + string.digits, k=16))
-            code = code.replace(f'name="{module_name}",', f'name="{modify_module_name}",')
-            return code
+            modify_code = code.replace(f'name="{module_name}",', f'name="{modify_module_name}",')
+            return modify_code, code
         else:
-            return code
+            return None, code
 
     return None
 

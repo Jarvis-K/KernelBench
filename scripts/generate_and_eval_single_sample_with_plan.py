@@ -46,7 +46,7 @@ class EvalConfig(Config):
         self.eval_mode = "local"
         # Construct this from mapping from architecture name to torch cuda arch list in the future
         # you can either specify SM version or just use the name
-        self.gpu_arch = ["Ada"]
+        self.gpu_arch = ['Hopper']
 
         # Archon config
         self.archon_config_path = None
@@ -61,6 +61,7 @@ class EvalConfig(Config):
         self.reflection = True
         # Logging
         self.logdir = os.path.join(REPO_TOP_DIR, "results/eval_logs/plan")
+        self.run_dir = os.path.join(REPO_TOP_DIR, "runs/")
         self.kernel_eval_build_dir = os.path.join(REPO_TOP_DIR, "cache")
         self.verbose = False
         self.recent_hist_flag = False
@@ -90,12 +91,12 @@ def remove_cache_dir(cache_dir: str, model_name: str, iteration_num, sample_id, 
 def compile_kernel(prompt, iteration_num, sample_id):
     try:
         build_dir = os.path.join(global_config.kernel_eval_build_dir, "eval_single_sample", global_config.model_name, f"{global_config.problem_id}", f"{iteration_num}", f"{sample_id}")
-        response = inference_server(prompt)
-        kernel_src = extract_first_code(response, ["python", "cpp"])
+        response, tokens = inference_server(prompt)
+        kernel_src, original_code = extract_first_code(response, ["python", "cpp"])
         success, stdout, error = build_compile_cache(kernel_src, global_config.verbose, build_dir)
         if success:
             logging.info(f"Compiled kernel for Iteration {iteration_num}, Sample ID: {sample_id}")
-            return (iteration_num, sample_id, response, kernel_src)
+            return (iteration_num, sample_id, response, kernel_src, tokens, original_code, )
         else:
             logging.error(f"Compilation FAILED for Iteration {iteration_num}, Sample ID: {sample_id}: {error}")
             remove_cache_dir(global_config.kernel_eval_build_dir, global_config.model_name, iteration_num, sample_id, global_config)
@@ -140,11 +141,13 @@ class KernelAgent:
         self.current_prompt = None
         self.ref_arch_src = None
         self.plan = ""
+        self.plan_tokens = 0
 
         self.prompts = []
         self.responses = []
         self.results = []
         self.codes = []
+        self.original_codes = []
 
         self.best_prompt = None
         self.best_response = None
@@ -171,16 +174,17 @@ class KernelAgent:
         example_flag = True if self.iteration_num == 0 else self.config.example_flag
         if self.config.plan_flag and not first_step_flag:
             plan_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=True)
-            self.plan = self.plan_server(plan_prompt)
+            self.plan, plan_tokens = self.plan_server(plan_prompt)
+            self.plan_tokens = plan_tokens
 
         if self.config.reflection:
             if not self.config.best_hist_flag:
-                hist_codes = self.codes[-self.config.hist_num:]
+                hist_codes = self.original_codes[-self.config.hist_num:]
                 hist_results = self.results[-self.config.hist_num:]
                 improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan)
             else:
                 sort_idx = sorted(range(len(self.results)), key=lambda x: self.results[x]['speed_up'])
-                hist_codes = [self.codes[i] for i in sort_idx][-self.config.hist_num:]
+                hist_codes = [self.original_codes[i] for i in sort_idx][-self.config.hist_num:]
                 hist_results = [self.results[i] for i in sort_idx][-self.config.hist_num:]
                 improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan)
         else:
@@ -193,7 +197,7 @@ class KernelAgent:
         compile_results = compile_all_kernels(self.current_prompt, self.iteration_num)
         # import pdb; pdb.set_trace()
         results = []
-        for problem_id, sample_id, response, code in compile_results:
+        for problem_id, sample_id, response, code, tokens, original_code in compile_results:
             result = eval_kernel_against_ref(
                 self.ref_arch_src,
                 code,
@@ -207,6 +211,8 @@ class KernelAgent:
             result = vars(result)
             result['iteration'] = self.iteration_num
             result['sample_id'] = sample_id
+            result['plan_tokens'] = self.plan_tokens
+            result['inference_tokens'] = tokens
             results.append(result)
             self.save_results_single_sample(code, response, result, sample_id)
         
@@ -217,13 +223,15 @@ class KernelAgent:
         result = results[min_runtime_idx]
         code = compile_results[min_runtime_idx][3]
         response = compile_results[min_runtime_idx][2]
-        return result, code, response
+        original_code = compile_results[min_runtime_idx][5]
+        return result, code, response, original_code
 
     def get_results(self, ref_arch_src, num_correct_trials=5, num_perf_trials=100, verbose=False):
-        result, code, response = self.get_code_and_compile()
+        result, code, response, original_code = self.get_code_and_compile()
         self.results.append(result)
         self.responses.append(response)
         self.codes.append(code)
+        self.original_codes.append(original_code)
 
         if self.best_result is None:
             self.best_prompt = self.current_prompt
@@ -303,6 +311,9 @@ class KernelAgent:
         
     def save_best_results(self):
         # 保存最佳结果
+        run_dir = os.path.join(self.config.run_dir, f"test_hf_level_{self.config.level}/{self.config.model_name}/")
+        if not os.path.exists(run_dir):
+            os.makedirs(run_dir, exist_ok=True)
         if self.best_result:
             best_dir = os.path.join(self.output_dir, "best_results")
             os.makedirs(best_dir, exist_ok=True)
@@ -313,6 +324,9 @@ class KernelAgent:
             with open(os.path.join(best_dir, "best_result.json"), "w") as f:
                 json.dump(self.best_result, f, indent=4)
             with open(os.path.join(best_dir, "best_code.py"), "w") as f:
+                f.write(self.best_code)
+
+            with open(os.path.join(run_dir, f"level_{self.config.level}_problem_{self.config.problem_id}_sample_0_kernel.py"), "w") as f:
                 f.write(self.best_code)
 
     def draw_results(self):
@@ -349,8 +363,8 @@ def main(config: EvalConfig):
     elif config.dataset_src == "local":
         curr_level_dataset = construct_kernelbench_dataset(config.level)
 
-    if config.gpu_arch:
-        set_gpu_arch(config.gpu_arch)  # 否则为所有架构构建
+    # if config.gpu_arch:
+    #     set_gpu_arch(config.gpu_arch)  # 否则为所有架构构建
 
     os.makedirs(config.logdir, exist_ok=True)
         
@@ -390,10 +404,8 @@ def main(config: EvalConfig):
         time_generation=True
     )
     plan_server = create_inference_server_from_presets(
-        # server_type="volcengine",
-        # model_name="ep-20250214154957-c777d",
-        server_type="pandas",
-        model_name="gpt-4o-mini",
+        server_type=config.server_type,
+        model_name=config.model_name,
         temperature=1.0,
         max_tokens=8192,
         verbose=False,

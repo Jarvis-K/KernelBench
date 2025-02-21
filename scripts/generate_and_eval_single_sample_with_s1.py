@@ -261,8 +261,8 @@ def main(config: EvalConfig):
     elif config.dataset_src == "local":
         curr_level_dataset = construct_kernelbench_dataset(config.level)
 
-    if config.gpu_arch:
-        set_gpu_arch(config.gpu_arch)  # 否则为所有架构构建
+    # if config.gpu_arch:
+    #     set_gpu_arch(config.gpu_arch)  # 否则为所有架构构建
 
     os.makedirs(config.logdir, exist_ok=True)
         
