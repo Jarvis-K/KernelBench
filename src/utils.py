@@ -49,7 +49,7 @@ SAMBANOVA_API_KEY = os.environ.get("SAMBANOVA_API_KEY")
 PANDAS_API_KEY = os.environ.get("PANDAS_API_KEY")
 VOLCENGINE_API_KEY = os.environ.get("VOLCENGINE_API_KEY")
 SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY")
-
+HUAWEI_API_URL = os.environ.get("HUAWEI_API_URL")
 ########################################################
 # Inference Helpers
 ########################################################
@@ -199,6 +199,9 @@ def query_server(
                 timeout=10000000,
                 max_retries=3,
             )
+            model = model_name
+        case "huawei":
+            client = "huawei"
             model = model_name
         case _:
             raise NotImplementedError
@@ -383,6 +386,24 @@ def query_server(
         )
         
         outputs = [choice.text.strip() for choice in response.choices]
+    elif server_type == "huawei":
+        import requests
+        api_url = HUAWEI_API_URL
+
+        headers = {
+            "Content-Type": "application/json",
+        }
+        
+        data = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        response = requests.post(api_url, headers=headers, json=data)
+        response = response.json()
+        outputs = [response['choices'][0]['message']['content'].split("</think>")[-1]]
+        tokens = response['usage']['total_tokens']
     else:
         if type(prompt) == str:
             response = client.completions.create(
@@ -483,6 +504,11 @@ SERVER_PRESETS = {
     },
     "siliconflow-completion": {
         "model_name": "DeepSeek-R1-Distill-Llama-8B",
+        "temperature": 0.0,
+        "max_tokens": 8192,
+    },
+    "huawei": {
+        "model_name": "DeepSeek-R1",
         "temperature": 0.0,
         "max_tokens": 8192,
     },
@@ -588,7 +614,7 @@ def extract_first_code(output_string: str, code_language_types: list[str]) -> st
             if code.startswith(code_type):
                 code = code[len(code_type) :].strip()
 
-        module_name = re.search(r"name=\"(.*?)\",", code, re.DOTALL)
+        module_name = re.search(r"name\s*=\s*['\"](.*?)['\"],", code, re.DOTALL)
 
         if "if __name__ ==" in code:
             code = code.split("if __name__ ==")[0]
@@ -598,7 +624,13 @@ def extract_first_code(output_string: str, code_language_types: list[str]) -> st
             # 随机生成16位字符串
             import string
             modify_module_name = module_name + "_" + ''.join(random.choices(string.ascii_letters + string.digits, k=16))
-            modify_code = code.replace(f'name="{module_name}",', f'name="{modify_module_name}",')
+            
+            # 使用正则表达式进行替换
+            modify_code = re.sub(
+                r"name\s*=\s*['\"]" + re.escape(module_name) + r"['\"]",
+                f'name="{modify_module_name}"',
+                code
+            )
             return modify_code, code
         else:
             return None, code

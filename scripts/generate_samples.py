@@ -10,7 +10,7 @@ from datasets import load_dataset
 
 from src.dataset import construct_kernelbench_dataset
 from src.eval import eval_kernel_against_ref
-from src.prompt_constructor import prompt_generate_custom_cuda_from_prompt_template
+from src.prompt_constructor import prompt_generate_custom_cuda_from_prompt_template, prompt_generate_custom_cuda_from_prompt_template_reflection
 from src.utils import extract_first_code, set_gpu_arch, read_file, create_inference_server_from_presets, maybe_multithread
 
 """
@@ -100,16 +100,16 @@ def generate_sample_single(work: WorkArgs, config: GenerationConfig, dataset, in
     
 
     # Construct Prompt   
-    custom_cuda_prompt = prompt_generate_custom_cuda_from_prompt_template(ref_arch_src)
+    custom_cuda_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(ref_arch_src)
     if config.log_prompt:
         prompt_path = os.path.join(run_dir, f"level_{config.level}_problem_{work.problem_id}_sample_{work.sample_id}_prompt.txt")
         with open(prompt_path, "w") as f:
             f.write(custom_cuda_prompt)
 
     # Query server with constructed prompt
-    custom_cuda = inference_server(custom_cuda_prompt)
+    custom_cuda, tokens = inference_server(custom_cuda_prompt)
     print(f"Custom CUDA: {custom_cuda}")
-    custom_cuda = extract_first_code(custom_cuda, ["python", "cpp"])
+    custom_cuda, original_code = extract_first_code(custom_cuda, ["python", "cpp"])
     # check LLM is able to generate custom CUDA code
     assert custom_cuda is not None, "Custom CUDA code generation failed"
 

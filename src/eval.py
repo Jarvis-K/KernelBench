@@ -359,6 +359,7 @@ def eval_kernel_against_ref(
         ModelNew = load_custom_model(custom_model_src, context, build_dir)
         torch.cuda.synchronize(device=device)  # not sure if this is too much
     except Exception as e:
+        # torch.cuda.init()
         print(
             f"Failed to compile custom CUDA kernel: Record as compilation failure. \nError: {e}"
         )

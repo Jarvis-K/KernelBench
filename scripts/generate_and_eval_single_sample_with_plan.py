@@ -5,6 +5,7 @@ import torch
 import json
 import concurrent.futures
 import multiprocessing as mp
+import subprocess
 import logging
 import shutil
 from tqdm import tqdm
@@ -70,6 +71,7 @@ class EvalConfig(Config):
         self.plan_flag = True
         self.hist_num = 5
         self.sample_num = 10
+        self.prompt_file = None
 
     def __repr__(self):
         return f"EvalConfig({self.to_dict()})"
@@ -96,15 +98,15 @@ def compile_kernel(prompt, iteration_num, sample_id):
         success, stdout, error = build_compile_cache(kernel_src, global_config.verbose, build_dir)
         if success:
             logging.info(f"Compiled kernel for Iteration {iteration_num}, Sample ID: {sample_id}")
-            return (iteration_num, sample_id, response, kernel_src, tokens, original_code, )
+            return (iteration_num, sample_id, response, kernel_src, tokens, original_code, True)
         else:
             logging.error(f"Compilation FAILED for Iteration {iteration_num}, Sample ID: {sample_id}: {error}")
             remove_cache_dir(global_config.kernel_eval_build_dir, global_config.model_name, iteration_num, sample_id, global_config)
-            return None
+            return (iteration_num, sample_id, response, kernel_src, tokens, original_code, False)
     except Exception as e:
         logging.error(f"Exception during compilation for Iteration {iteration_num}, Sample ID: {sample_id}: {e}")
         remove_cache_dir(global_config.kernel_eval_build_dir, global_config.model_name, iteration_num, sample_id, global_config)
-        return None
+        return (iteration_num, sample_id, response, kernel_src, tokens, original_code, False)
 
 def compile_kernel_wrapper(args):
     prompt, iteration_num, sample_id = args
@@ -122,15 +124,23 @@ def compile_all_kernels(prompt, iteration_num) -> list[tuple[int, int]]:
     successful_compilations = []
 
     with mp.Pool(processes=global_config.sample_num) as pool:
-        async_results = [
-            pool.apply_async(compile_kernel_wrapper, ((prompt, iteration_num, sample_id),))
-            for sample_id in range(global_config.sample_num)
-        ]
+        async_results = []
+        for sample_id in range(global_config.sample_num):
+            args = (prompt, iteration_num, sample_id)
+            async_result = pool.apply_async(compile_kernel_wrapper, (args,))
+            async_results.append((sample_id, async_result))
 
-        for async_result in tqdm(async_results, total=global_config.sample_num, desc="Compiling Kernels"):
-            result = async_result.get()
-            if result is not None:
-                successful_compilations.append(result)
+        for sample_id, async_result in tqdm(async_results, total=global_config.sample_num, desc="Compiling Kernels"):
+            try:
+                result = async_result.get(timeout=1200)  # 60秒超时
+                if result is not None:
+                    successful_compilations.append(result)
+            except mp.TimeoutError:
+                logging.error(f"Compilation timed out for sample {sample_id}")
+                remove_cache_dir(global_config.kernel_eval_build_dir, global_config.model_name, iteration_num, sample_id, global_config)
+            except Exception as e:
+                logging.error(f"Error compiling kernel for sample {sample_id}: {e}")
+                remove_cache_dir(global_config.kernel_eval_build_dir, global_config.model_name, iteration_num, sample_id, global_config)
 
     return successful_compilations
 
@@ -153,6 +163,7 @@ class KernelAgent:
         self.best_response = None
         self.best_result = None
         self.best_code = None
+        self.plan_prompt = ""
 
         self.iteration_num = 0
         self.output_dir = os.path.join(self.config.logdir, self.config.model_name, f"level_{self.config.level}", f"problem_{self.config.problem_id}")
@@ -172,23 +183,32 @@ class KernelAgent:
     def refine_prompt(self):
         first_step_flag = True if self.iteration_num == 0 else False
         example_flag = True if self.iteration_num == 0 else self.config.example_flag
-        if self.config.plan_flag and not first_step_flag:
-            plan_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=True)
-            self.plan, plan_tokens = self.plan_server(plan_prompt)
-            self.plan_tokens = plan_tokens
-
-        if self.config.reflection:
+        if self.config.prompt_file is not None and os.path.exists(self.config.prompt_file) and first_step_flag:
+            with open(self.config.prompt_file, "r") as f:
+                improvement_prompt = f.read()
+            self.init_prompt = improvement_prompt
+        else:
             if not self.config.best_hist_flag:
                 hist_codes = self.original_codes[-self.config.hist_num:]
                 hist_results = self.results[-self.config.hist_num:]
-                improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan)
             else:
-                sort_idx = sorted(range(len(self.results)), key=lambda x: self.results[x]['speed_up'])
+                sort_idx = sorted(range(len(self.results)), key=lambda x: self.results[x]['speed_up'] if 'speed_up' in self.results[x] else -100.0)
                 hist_codes = [self.original_codes[i] for i in sort_idx][-self.config.hist_num:]
                 hist_results = [self.results[i] for i in sort_idx][-self.config.hist_num:]
-                improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan)
-        else:
-            improvement_prompt = prompt_generate_custom_cuda_from_prompt_template(self.ref_arch_src)
+
+            if self.config.plan_flag and not first_step_flag:
+                plan_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=True, plan=self.plan)
+                self.plan, plan_tokens = self.plan_server(plan_prompt)
+                self.plan_tokens = plan_tokens
+                self.plan_prompt = plan_prompt
+
+            if self.config.reflection:
+                if not self.config.best_hist_flag:
+                    improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan)
+                else:
+                    improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan)
+            else:
+                improvement_prompt = prompt_generate_custom_cuda_from_prompt_template(self.ref_arch_src)
 
         self.current_prompt = improvement_prompt
         self.prompts.append(self.current_prompt)
@@ -197,33 +217,99 @@ class KernelAgent:
         compile_results = compile_all_kernels(self.current_prompt, self.iteration_num)
         # import pdb; pdb.set_trace()
         results = []
-        for problem_id, sample_id, response, code, tokens, original_code in compile_results:
-            result = eval_kernel_against_ref(
-                self.ref_arch_src,
-                code,
-                verbose=self.config.verbose,
-                measure_performance=True,
-                num_correct_trials=5,
-                num_perf_trials=100,
-                device = torch.device(f"cuda:{self.config.device_id}"),
-                build_dir=os.path.join(self.config.kernel_eval_build_dir, "eval_single_sample", self.config.model_name, f"{self.config.problem_id}", f"{self.iteration_num}", f"{sample_id}")
-            )
-            result = vars(result)
-            result['iteration'] = self.iteration_num
-            result['sample_id'] = sample_id
-            result['plan_tokens'] = self.plan_tokens
-            result['inference_tokens'] = tokens
+        eval_args = []
+        for cr in compile_results:
+            problem_id, sample_id, response, code, tokens, original_code, successful_flag = cr
+            if successful_flag:
+                build_dir = os.path.join(
+                    self.config.kernel_eval_build_dir, 
+                    "eval_single_sample", 
+                    self.config.model_name, 
+                    f"{self.config.problem_id}",
+                    f"{self.iteration_num}",
+                    f"{sample_id}"
+                )
+                eval_args.append([
+                    '--ref_arch_src', self.ref_arch_src,
+                    '--code', code,
+                    '--build_dir', build_dir,
+                    '--device_id', str(self.config.device_id),
+                    '--verbose', str(int(self.config.verbose)),
+                    '--num_correct_trials', '5',  # num_correct_trials
+                    '--num_perf_trials', '50'  # num_perf_trials
+                ])
+        
+        eval_results = []
+        for eval_arg in tqdm(eval_args):
+            cmd = ['python3', 'scripts/evaluate_kernel.py'] + eval_arg
+            try:
+                # 设置超时时间为60秒
+                _result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                import re
+                
+                try:
+                    print(f"Evaluation result: {_result.stdout}")
+                    result = re.findall('(\{\"iteration\":.+\})\n', _result.stdout)[0]
+                    result = json.loads(result)
+                    eval_results.append(result)
+                except Exception as e:
+                    logging.error(f"Failed to parse result: {str(e)}")
+                    import pdb; pdb.set_trace()
+            except subprocess.TimeoutExpired:
+                logging.error("Subprocess timed out")
+                eval_results.append({
+                    "iteration": -1,
+                    "compiled": True,
+                    "correctness": False,
+                    "runtime": float('inf'),
+                    "baseline_runtime": 0.0,
+                    "speed_up": 0.0,
+                    "metadata": "error: Subprocess timed out"
+                })
+
+        # 处理评估结果
+        successful_idx = 0
+        for idx, cr in enumerate(compile_results):
+            if not cr[-1]:
+                result = {
+                    "iteration": self.iteration_num,
+                    "compiled": False,
+                    "correctness": False,
+                    "sample_id": cr[1],
+                    "plan_tokens": self.plan_tokens,
+                    "inference_tokens": cr[5],
+                    "runtime": float('inf'),
+                    "baseline_runtime": 0.0,
+                    "speed_up": 0.0,
+                    "metadata": "error: Compilation failed"
+                    
+                }
+                self.save_results_single_sample(code, response, result, sample_id)
+                continue
+            eval_result = eval_results[successful_idx]
+            problem_id, sample_id, response, code, tokens, original_code, successful_flag = cr
+            result = eval_result
+            successful_idx += 1
+            # 添加元数据
+            result.update({
+                'iteration': self.iteration_num,
+                'sample_id': sample_id,
+                'plan_tokens': self.plan_tokens,
+                'inference_tokens': tokens
+            })
+            
             results.append(result)
             self.save_results_single_sample(code, response, result, sample_id)
         
         result_idxs = range(len(results))
         if len(result_idxs) == 0:
-            return {}, "", ""
-        min_runtime_idx = min(result_idxs, key=lambda x: results[x]['runtime'] if results[x]['correctness'] else float('inf'))
-        result = results[min_runtime_idx]
-        code = compile_results[min_runtime_idx][3]
-        response = compile_results[min_runtime_idx][2]
-        original_code = compile_results[min_runtime_idx][5]
+            return result, "", "", ""
+        result = min(results, key=lambda result: result['runtime'] if 'correctness' in result and result['correctness'] else float('inf'))
+        result_id = result['sample_id']
+        best_compile_result = [compile_result for compile_result in compile_results if compile_result[1]==result_id][0]
+        code = best_compile_result[3]
+        response = best_compile_result[2]
+        original_code = best_compile_result[5]
         return result, code, response, original_code
 
     def get_results(self, ref_arch_src, num_correct_trials=5, num_perf_trials=100, verbose=False):
@@ -240,8 +326,8 @@ class KernelAgent:
             self.best_code = code
             print(f"Best result updated: {self.best_result}")
         else:
-            if isinstance(result, dict) and result.get("correctness", True):
-                if not (isinstance(self.best_result, dict) and self.best_result.get("correctness", False)):
+            if isinstance(result, dict) and result.get("correctness", False):
+                if not (isinstance(self.best_result, dict) or not self.best_result.get("correctness", False)):
                     self.best_prompt = self.current_prompt
                     self.best_response = response
                     self.best_result = result
@@ -258,7 +344,7 @@ class KernelAgent:
         self.iteration_num += 1
 
     def update_speedup(self, ):
-        baseline_results = [result for result in self.results if result["correctness"]]
+        baseline_results = [result for result in self.results if "correctness" in result and result["correctness"]]
         if len(baseline_results) == 0:
             print("No correct results found, cannot update speedup")
             for i, result in enumerate(self.results):
@@ -276,7 +362,7 @@ class KernelAgent:
         os.makedirs(iteration_dir, exist_ok=True)
         with open(os.path.join(iteration_dir, f"kernel_code_{sample_id}.py"), "w") as f:
             f.write(code)
-        with open(os.path.join(iteration_dir, f"response_{sample_id}.text"), "w") as f:
+        with open(os.path.join(iteration_dir, f"response_{sample_id}.txt"), "w") as f:
             f.write(response)
         
         if os.path.exists(os.path.join(iteration_dir, f"result_all.json")):
@@ -303,6 +389,8 @@ class KernelAgent:
             json.dump(self.results[iteration_num], f, indent=4)
         with open(os.path.join(iteration_dir, "kernel_code.py"), "w") as f:
             f.write(self.codes[iteration_num])
+        with open(os.path.join(iteration_dir, "plan_prompt.txt"), "w") as f:
+            f.write(self.plan_prompt)
 
         # 保存汇总结果
         eval_results_path = os.path.join(self.output_dir, "eval_results.json")
@@ -334,8 +422,8 @@ class KernelAgent:
         import seaborn as sns
         import json
 
-        # 提取所有迭代的结果
-        all_results = [result['speed_up'] for result in self.results]
+        # 提取所有迭代的结果，如果speedup不在result中，则为0.0
+        all_results = [result['speed_up'] if 'speed_up' in result else 0.0 for result in self.results]
         
         # 绘制结果
         sns.set_style("whitegrid")
@@ -344,6 +432,10 @@ class KernelAgent:
         plt.xlabel('Iteration')
         plt.ylabel('Speed Up')
         plt.title('Speed Up of Each Iteration')
+        
+        # 设置横坐标为从0开始的整数
+        plt.xticks(range(len(all_results)))
+        
         plt.savefig(os.path.join(self.output_dir, "speed_up_plot.png"))
         plt.close()
 
@@ -392,6 +484,9 @@ def main(config: EvalConfig):
         f"Problem number in filename ({problem_number}) does not match config problem_id ({config.problem_id})"
     )
     kernel_agent = KernelAgent(config)
+    # 如果存在结果文件夹，先删除
+    if os.path.exists(kernel_agent.output_dir):
+        shutil.rmtree(kernel_agent.output_dir, ignore_errors=True)
 
     # 2. 初始化推理服务及初始 prompt
     inference_server = create_inference_server_from_presets(
@@ -404,8 +499,10 @@ def main(config: EvalConfig):
         time_generation=True
     )
     plan_server = create_inference_server_from_presets(
-        server_type=config.server_type,
-        model_name=config.model_name,
+        # server_type=config.server_type,
+        # model_name=config.model_name,
+        server_type="pandas",
+        model_name="gpt-4o-mini",
         temperature=1.0,
         max_tokens=8192,
         verbose=False,
