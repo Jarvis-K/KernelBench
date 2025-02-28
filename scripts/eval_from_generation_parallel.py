@@ -183,6 +183,7 @@ def evaluate_single_sample(work_args: WorkArgs, configs: EvalConfig, dataset, ru
             eval_result = KernelExecResult(
                 compiled=False, correctness=False, metadata=metadata
             )
+            time.sleep(5)
             return eval_result
         else:
             metadata = {"other_error": f"error: {str(e)}",

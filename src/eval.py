@@ -13,8 +13,10 @@ import json
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
 import sys
-
+import threading
 from . import utils
+import re
+import time
 
 REPO_TOP_PATH = os.path.abspath(
     os.path.join(
@@ -175,46 +177,6 @@ def graceful_eval_cleanup(curr_context: dict, device: torch.device):
 
     # _cleanup_cuda_extensions() # SIMON NOTE: is this necessary?
 
-def build_compile_cache_legacy(
-    custom_model_src: str,
-    verbose: bool = False,
-    build_dir: os.PathLike = None,
-) -> tuple[bool, str, str]:
-    """
-    Try to build the compiled cuda code for sample and store in the cache directory
-    Should be able to run on CPUs to do this massively in parallel
-
-    Don't limit ninja to set default number of workers, let it use all the cpu cores possible
-
-    NOTE: currently stdout_buffer does not capture all the compiler warning and failure messages
-    Returns:
-        tuple[bool, str]: whether compilation is successful, stdout content as string
-    """
-    context = {}
-    stdout_buffer = StringIO()
-
-    if verbose:
-        print("[Compilation] Pre-compile custom cuda binaries")
-
-    try:
-        os.environ["TORCH_USE_CUDA_DSA"] = "1"  # compile with device side assertion
-        # sys.stdout.flush()
-
-        # Capture stdout during compilation
-        with redirect_stdout(stdout_buffer), redirect_stderr(stdout_buffer):
-            load_custom_model(custom_model_src, context, build_dir)
-            # sys.stdout.flush()
-
-        if verbose:
-            print(f"[Compilation] Compilation Successful, saved cache at: {build_dir}")
-    except Exception as e:
-        print(f"[Compilation] Failed to compile custom CUDA kernel. Unable to cache, \nError: {e}")
-        return False, stdout_buffer.getvalue(), str(e)
-    
-    return True, stdout_buffer.getvalue(), None
-
-
-
 def build_compile_cache(
     custom_model_src: str,
     verbose: bool = False,
@@ -228,30 +190,80 @@ def build_compile_cache(
     # try do this with a subprocess
     NOTE: currently stdout_buffer does not capture all the compiler warning and failure messages
     Returns:
-        tuple[bool, str]: whether compilation is successful, stdout content as string
+        tuple[bool, str, str]: whether compilation is successful, stdout content as string, error message
     """
-    context = {}
-    stdout_buffer = StringIO()
+    # 这里我们必须使用子进程方法来捕获所有编译输出
+    # 因为底层编译工具的输出无法通过Python的标准输出/错误重定向捕获
+    
+    # 确保设置TORCH_USE_CUDA_DSA环境变量
+    os.environ["TORCH_USE_CUDA_DSA"] = "1"
+    
+    if build_dir:
+        # 添加必要的环境变量设置到源代码
+        custom_model_src = (
+            "import os\n" 
+            f"os.environ['TORCH_EXTENSIONS_DIR'] = '{build_dir}'\n"
+            "os.environ['TORCH_USE_CUDA_DSA'] = '1'\n"
+        ) + custom_model_src
+
+    # 创建临时Python文件
+    kernel_hash = hash(custom_model_src)
+    tmp_file = os.path.join(build_dir if build_dir else "/tmp", f"tmp_compile_{kernel_hash}.py")
+    os.makedirs(os.path.dirname(tmp_file), exist_ok=True)
+    
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        f.write(custom_model_src)
 
     if verbose:
         print("[Compilation] Pre-compile custom cuda binaries")
 
+    # 使用子进程执行编译，这样可以捕获所有输出
+    process = subprocess.Popen(
+        ['python', tmp_file], 
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.PIPE,
+        text=True,
+        env=dict(os.environ, TORCH_USE_CUDA_DSA="1")  # 确保子进程也设置了环境变量
+    )
+    stdout, stderr = process.communicate()
+    
+    # 清理临时文件
     try:
-        os.environ["TORCH_USE_CUDA_DSA"] = "1"  # compile with device side assertion
-        # sys.stdout.flush()
-
-        # Capture stdout during compilation
-        with redirect_stdout(stdout_buffer), redirect_stderr(stdout_buffer):
-            load_custom_model(custom_model_src, context, build_dir)
-            # sys.stdout.flush()
-
+        os.remove(tmp_file)
+    except:
+        pass
+    
+    # 合并输出
+    all_output = stdout + "\n" + stderr
+    
+    # 检查编译是否成功
+    if process.returncode != 0:
         if verbose:
-            print(f"[Compilation] Compilation Successful, saved cache at: {build_dir}")
-    except Exception as e:
-        print(f"[Compilation] Failed to compile custom CUDA kernel. Unable to cache, \nError: {e}")
-        return False, stdout_buffer.getvalue(), str(e)
+            print(f"[Compilation] Failed to compile custom CUDA kernel. Return code: {process.returncode}")
+            print("========================================================")
+            print(all_output)
+            print("========================================================")
+        return False, all_output, f"Compilation failed with return code {process.returncode}"
+    
+    if verbose:
+        print(f"[Compilation] Compilation Successful, saved cache at: {build_dir}")
+        print("========================================================")
+        print(all_output)
+        print("========================================================")
+    
+    # 尝试加载模型以验证编译是否真正成功
 
-    return True, stdout_buffer.getvalue(), None
+    try:
+        context = {}
+        from io import StringIO
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            load_custom_model(custom_model_src, context, build_dir)
+        return True, all_output, None
+    except Exception as e:
+        error_msg = str(e)
+        if verbose:
+            print(f"[Compilation] Compiled but failed to load model: {error_msg}")
+        return False, all_output, error_msg
 
 
 def build_compile_cache_with_capturing(
@@ -293,9 +305,6 @@ def build_compile_cache_with_capturing(
         print("[CPU Precompile] stderr: \n", stderr.decode('utf-8')) 
 
     return returncode, stdout.decode('utf-8'), stderr.decode('utf-8')
-
-
-
 
 def eval_kernel_against_ref(
     original_model_src: str,

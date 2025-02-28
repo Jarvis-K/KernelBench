@@ -1,5 +1,6 @@
 import os
 from .utils import read_file
+import re
 
 
 """
@@ -19,10 +20,10 @@ REPO_TOP_PATH = os.path.abspath(
 KERNEL_BENCH_PATH = os.path.join(REPO_TOP_PATH, "KernelBench")
 
 def parser_result(result, round=None, wait_flag=False):
-    s = f"In round {round}, " if round is not None else f"In round {result['iteration']+1}, "
-    s = s if not wait_flag else "In this generation, "
+    s = f"Here is your Evaluation Result:\n"
+    # s = s if not wait_flag else "In this generation, "
     if not result['compiled']:
-        s += f"the custom cuda code failed to compile. The error is: {str(result['metadata'])[:200]}..."
+        s += f"the custom cuda code failed to compile. The error is: {str(result['metadata'])}"
     else:
         s += f"the custom cuda code compiled successfully, "
         if result['correctness']:
@@ -51,7 +52,7 @@ def get_arch_definition(arch_src):
 # PROBLEM_STATEMENT = """You are an expert in CUDA programming and performance optimization. You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups. \n
 #     You have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.\n
 # """
-PROBLEM_STATEMENT = """You are an expert in CUDA programming and performance optimization. Please write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups on H100 GPU. \nYou are only limited by your imagination.\n
+PROBLEM_STATEMENT = """You are an expert in CUDA programming and performance optimization. Please write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups. You are only limited by your imagination.\n
 """
 # PROBLEM_INSTRUCTION = """
 # Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! \n
@@ -117,10 +118,10 @@ def prompt_generate_custom_cuda_reflection(
     ```
     """
 
-    prompt += f"""
-    Here's the information of H100 GPU: 
-    {H100_description}
-    """
+    # prompt += f"""
+    # Here's the information of H100 GPU: 
+    # {H100_description}
+    # """
     if hist_results:
         if best_hist_flag:
             improvement_prompt = f"Below is the previously generated CUDA kernel code:\n"
@@ -144,28 +145,75 @@ def prompt_generate_custom_cuda_reflection(
         prompt += improvement_prompt
     
     if not plan_flag:
-        prompt += PROBLEM_INSTRUCTION
-        if hist_results:
-            prompt += "Please generate the best CUDA kernel code for the given architecture based on the previous generations with feedbacks and the differences and optimizations between the previously generated codes. Please consider the hardware information of H100 GPU."
+        # if hist_results:
+        #     prompt += "Please generate the best CUDA kernel code for the given architecture based on the previous generations with feedbacks and the differences and optimizations between the previously generated codes."
+        prompt += "Please optimize and generate the best CUDA kernel code for the given architecture based on the previous generation with feedbacks. Name your new improved output architecture ModelNew. Output the new code in codeblocks, Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! Please output the complete code in a python code block."
     else:
         if generate_plan_flag:
             if first_step_flag:
                 # prompt += "Please generate a short, general and brief generation policy of the custom CUDA kernel for the given architecture. There's no need to generate the code."
                 pass
             else:
-                if "the speed up is" in prompt:
-                    prompt += "\nGiven the above CUDA codes and corresponding feedbacks, analyze it thoroughly for any potential inefficiencies. Suggest the most important optimization that would significantly improve the code's performance. Provide the clear, actionable recommendation. There's no need to output the complete code, just the optimization directions. Please keep your answers as concise as possible."
-                else:
-                    prompt += "\nGiven the following CUDA code and the corresponding feedbacks, thoroughly analyze it for corresponding errors. Your primary task is to identify the wrong code snippets, fix them and give the correct ones. There's no need to output the complete code, just the brief, the most important and actionable modification. Please keep your answers as concise as possible."
+#                 if "the speed up is" in prompt:
+#                     # prompt += "\nGiven the above CUDA codes and corresponding feedbacks, analyze it thoroughly for any potential inefficiencies. Suggest the most important optimization that would significantly improve the code's performance. Provide the clear, actionable recommendation. There's no need to output the complete code, just the optimization directions. Please keep your answers as concise as possible."
+#                     prompt += "\nGiven the following CUDA code and the corresponding feedbacks, thoroughly analyze it for possible inefficiencies. Your primary task is to identify the possible inefficient code snippets, fix them and give the optimized ones. There's no need to output the complete code, just the brief, the most important and actionable optimization plan. Your plan should be concise but specific.\nFor each key optimization:\n"
+#                 else:
+#                     # prompt += "\nGiven the following CUDA code and the corresponding feedbacks, thoroughly analyze it for corresponding errors. Your primary task is to identify the wrong code snippets, fix them and give the correct ones. There's no need to output the complete code, just the brief, the most important and actionable modification. Please keep your answers as concise as possible."
+#                     prompt += "\nGiven the following CUDA code and the corresponding feedbacks, thoroughly analyze it for corresponding errors. Your primary task is to identify the wrong code snippets, fix them and give the correct ones. There's no need to output the complete code, just the brief, the most important and actionable modification plan. Your plan should be concise but specific.\nFor each key modification:\n"
+#                 prompt += """1. Identify the specific code section to modify
+# 2. Describe the exact change needed
+# 3. Briefly explain why this change improves performance
+
+# Format your response as:
+# 1. One paragraph summary of key performance differences
+# 2. Numbered list of specific optimizations, each with:
+#     - Target: [Detailed code snippet in the original code]
+#     - Change: [specific modification]
+#     - Reason: [brief technical explanation]
+
+# Focus only on the most impactful changes."""
+                prompt += """Please provide a focused, actionable optimization plan that identifies the MOST CRITICAL differences affecting performance. Your plan should be concise but specific.
+
+For each key optimization (limit to 3-5 most important changes):
+1. Identify the specific code section to modify
+2. Describe the exact change needed
+3. Briefly explain why this change improves performance
+
+Format your response as:
+1. One paragraph summary of key performance differences
+2. Numbered list of specific optimizations (3-5 items), each with:
+   - Target: [Detailed code snippet in the original code]
+   - Change: [specific modification]
+   - Reason: [brief technical explanation]
+
+Focus only on the most impactful changes.
+
+"""
         else:
             if first_step_flag:
                 # prompt += "Here is the generation policy for the given architecture:\n"
                 # prompt += plan
                 prompt += PROBLEM_INSTRUCTION
             else:
-                # prompt += "Here is the optimization directions for the given architecture and the previous generations with feedbacks:\n"
+                # prompt += "Here is the optimization directions for the given architecture and the previous generation:\n"
                 prompt += plan
-                prompt += "Using the optimization directions or error modification suggestions, rewrite the CUDA code to implement the suggested improvements. Ensure that any errors identified in the original code are fixed, and the optimizations are applied for better performance. Maintain the architecture's original functionality while ensuring it is error-free, runs faster, and is more efficient. Please output the complete code in a code block, not just the CUDA code. Please consider the hardware information of H100 GPU. Just output the new model code and NO testing code! And please Name your optimized output architecture ModelNew."
+                # prompt += "Using the optimization directions or error modification suggestions, rewrite the CUDA code to implement the suggested improvements. Ensure that any errors identified in the original code are fixed, and the optimizations are applied for better performance. Maintain the architecture's original functionality while ensuring it is error-free, runs faster, and is more efficient. Please output the complete code in a code block, not just the CUDA code. Please consider the hardware information of H100 GPU. Just output the new model code and NO testing code! And please Name your optimized output architecture ModelNew."
+
+                prompt += """\nImplement all the changes from the optimization plan. Your implementation must:
+1. Follow each optimization step precisely and strictly
+2. Maintain functional correctness
+3. Name the optimized architecture ModelNew
+
+Important requirements:
+- Your implementation must compile and execute correctly
+- Focus on implementing the specific optimizations in the plan
+- If you encounter any issues with the plan, implement the changes that make technical sense
+- Name your optimized architecture ModelNew
+- Just output the new model code and NO testing code
+- output the complete code in a python code block
+
+Please provide the complete improved code, including all necessary function and class definitions. Add brief comments before each modified section explaining the optimization applied.
+"""
             
     return prompt
 
@@ -692,6 +740,76 @@ def prompt_fix_correctness(ref_arch_src, custom_cuda, metadata):
     Please consider how your custom CUDA kernels are implemented, how it is different from the reference implementation, and fix the correctness error in the new model code. Please output the corrected code in codeblocks.
     """
     return prompt
+
+def prompt_generate_plan_evaluation(arc_src, kernel_src, plans):
+    """
+    生成用于评估和整合多个计划的提示
+    
+    Args:
+        plans: 要评估的计划列表
+        
+    Returns:
+        用于评估计划的提示
+    """
+    prompt = "You are a professional CUDA optimization expert tasked with evaluating multiple CUDA optimization plans and selecting the most effective optimization recommendations."
+    prompt += f"""
+    You are given the following architecture:
+    ```
+    {arc_src}
+    ```
+    You generated the following CUDA kernel code:
+    ```
+    {kernel_src}
+Please carefully analyze the following independently generated CUDA optimization plans and perform the following tasks:
+
+1. Evaluate the effectiveness and feasibility of the optimization recommendations proposed in each plan.
+2. Identify the most valuable and potentially performance-enhancing recommendations from each plan.
+3. From all the plans, select 3-5 of the most effective optimization recommendations to form a comprehensive optimization plan.
+4. Ensure that the selected recommendations do not overlap, are mutually compatible, and can collectively improve performance.
+
+Below are the optimization plans to be evaluated:
+"""
+    
+    for i, plan in enumerate(plans, 1):
+        prompt += f"\nPlan {i}:\n```\n{plan}\n```\n"
+    
+    prompt += """You should output the analysis of all the items in each plan one by one based on the architecture and the kernel code first, and finally, output the final optimization plan in the following format strictly:
+<Plan Start>
+Optimization Recommendations:
+1. Target: [specific code snippet to be modified]
+   Change: [specific modification plan]
+   Reason: [why this modification can improve performance]
+
+2. Target: [specific code snippet to be modified]
+   Change: [specific modification plan]
+   Reason: [why this modification can improve performance]
+
+...(3-5 recommendations)
+<Plan End>
+
+Please ensure that your final optimization plan is specific, technically feasible, and can significantly improve the performance of the CUDA kernel.
+"""
+    
+    return prompt
+
+def parser_plan_evaluation(response):
+    """
+    解析计划评估的响应
+    
+    Args:
+        response: 评估响应字符串
+        
+    Returns:    
+        整合后的最终计划
+    """
+    # 使用正则表达式提取整合后的计划
+    plan_pattern = r'<Plan Start>(.*?)<Plan End>'
+    match = re.search(plan_pattern, response, re.DOTALL)
+    if match:
+        return match.group(1)
+    else:
+        return None
+    
 
 def main():
     gpu_name = "L40S"

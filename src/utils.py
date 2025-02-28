@@ -284,6 +284,7 @@ def query_server(
             )
 
         outputs = [choice.message.content for choice in response.choices]
+        tokens = response.usage.total_tokens
     elif server_type == "openai" or server_type == "pandas":
         if (
             "o1" in model
@@ -357,7 +358,7 @@ def query_server(
             ],
             stream=False,
             n=num_completions,
-            max_tokens=max_tokens,
+            # max_tokens=max_tokens,
         )
         outputs = [choice.message.content for choice in response.choices]
         tokens = response.usage.total_tokens
@@ -398,10 +399,10 @@ def query_server(
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature,
-            "max_tokens": max_tokens,
         }
         response = requests.post(api_url, headers=headers, json=data)
         response = response.json()
+        print(response)
         outputs = [response['choices'][0]['message']['content'].split("</think>")[-1]]
         tokens = response['usage']['total_tokens']
     else:
@@ -633,7 +634,7 @@ def extract_first_code(output_string: str, code_language_types: list[str]) -> st
             )
             return modify_code, code
         else:
-            return None, code
+            return "", code
 
     return None
 

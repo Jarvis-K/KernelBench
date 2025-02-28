@@ -9,13 +9,23 @@ import subprocess
 import logging
 import shutil
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor
+import queue
+import signal
+import re
+import random
 
 from datasets import load_dataset
+import time
 
 from src.dataset import construct_kernelbench_dataset
 from src.eval import eval_kernel_against_ref, build_compile_cache
-from src.prompt_constructor import prompt_generate_custom_cuda_from_prompt_template, prompt_generate_custom_cuda_from_prompt_template_reflection
+from src.prompt_constructor import prompt_generate_custom_cuda_from_prompt_template, prompt_generate_custom_cuda_from_prompt_template_reflection, prompt_generate_plan_evaluation, parser_plan_evaluation
 from src.utils import extract_first_code, query_server, set_gpu_arch, read_file, create_inference_server_from_presets
+from evaluate_kernel import evaluate_kernel_wrapper, evaluate_kernel, evaluate_kernel_isolated
+
+# 设置环境变量，限制只使用GPU 1
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # 只使用GPU 1
 
 """
 Generate and evaluate a single sample
@@ -74,6 +84,9 @@ class EvalConfig(Config):
         self.prompt_file = None
         self.given_example_result = None
         self.given_example_code = None
+        self.plan_num = 5
+        self.plan_server_type = "pandas"
+        self.plan_model_name = "gpt-4o-mini"
 
     def __repr__(self):
         return f"EvalConfig({self.to_dict()})"
@@ -92,59 +105,232 @@ def remove_cache_dir(cache_dir: str, model_name: str, iteration_num, sample_id, 
         except Exception as e:
             print(f"\n[WARNING] Failed to remove cache directory {problem_cache_dir}: {str(e)}")
 
-def compile_kernel(prompt, iteration_num, sample_id):
+# 添加一个可序列化的推理服务器类
+class SerializableInferenceServer:
+    def __init__(self, server_type, model_name, temperature, max_tokens, verbose=False, 
+                 archon_config_path=None, time_generation=False):
+        self.server_type = server_type
+        self.model_name = model_name
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.verbose = verbose
+        self.archon_config_path = archon_config_path
+        self.time_generation = time_generation
+        # 在初始化时不创建实际的服务器函数
+        self._server_fn = None
+    
+    def __call__(self, prompt):
+        # 延迟初始化，在第一次调用时创建服务器函数
+        if self._server_fn is None:
+            self._server_fn = create_inference_server_from_presets(
+                server_type=self.server_type,
+                model_name=self.model_name,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                verbose=self.verbose,
+                archon_config_path=self.archon_config_path,
+                time_generation=self.time_generation
+            )
+        # 调用实际的服务器函数
+        return self._server_fn(prompt)
+
+# 添加一个可序列化的计划服务器类
+class SerializablePlanServer:
+    def __init__(self, server_type, model_name, temperature, max_tokens, verbose=False, 
+                 archon_config_path=None, time_generation=False):
+        self.server_type = server_type
+        self.model_name = model_name
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.verbose = verbose
+        self.archon_config_path = archon_config_path
+        self.time_generation = time_generation
+        # 在初始化时不创建实际的服务器函数
+        self._server_fn = None
+    
+    def __call__(self, prompt):
+        # 延迟初始化，在第一次调用时创建服务器函数
+        if self._server_fn is None:
+            self._server_fn = create_inference_server_from_presets(
+                server_type=self.server_type,
+                model_name=self.model_name,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                verbose=self.verbose,
+                archon_config_path=self.archon_config_path,
+                time_generation=self.time_generation
+            )
+        # 调用实际的服务器函数
+        return self._server_fn(prompt)
+
+# 修改compile_kernel_wrapper函数，不再传递inference_server_fn
+def compile_kernel_wrapper(args):
+    prompt, iteration_num, sample_id, config = args
+    kernel_src = ""
+    original_code = ""
     try:
-        build_dir = os.path.join(global_config.kernel_eval_build_dir, "eval_single_sample", global_config.model_name, f"{global_config.problem_id}", f"{iteration_num}", f"{sample_id}")
+        build_dir = os.path.join(config.kernel_eval_build_dir, "eval_single_sample", config.model_name, f"{config.problem_id}", f"{iteration_num}", f"{sample_id}")
+        # 在这里创建推理服务器
+        inference_server = SerializableInferenceServer(
+            server_type=config.server_type,
+            model_name=config.model_name,
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
+            verbose=config.verbose,
+            archon_config_path=config.archon_config_path,
+            time_generation=True
+        )
         response, tokens = inference_server(prompt)
         kernel_src, original_code = extract_first_code(response, ["python", "cpp"])
-        success, stdout, error = build_compile_cache(kernel_src, global_config.verbose, build_dir)
+        success, stdout, error = build_compile_cache(kernel_src, config.verbose, build_dir)
+
+        parsered_all_output = list(set(re.findall(r"(error: .*?)\n", stdout, re.DOTALL | re.MULTILINE)))
+        warnings = list(set(re.findall(r"(warning: .*?)\n", stdout, re.DOTALL | re.MULTILINE)))
+        stdout = '\n'.join(warnings+parsered_all_output) if len(warnings+parsered_all_output) > 0 else stdout
         if success:
             logging.info(f"Compiled kernel for Iteration {iteration_num}, Sample ID: {sample_id}")
             return (iteration_num, sample_id, response, kernel_src, tokens, original_code, True, stdout)
         else:
             logging.error(f"Compilation FAILED for Iteration {iteration_num}, Sample ID: {sample_id}: {error}")
-            remove_cache_dir(global_config.kernel_eval_build_dir, global_config.model_name, iteration_num, sample_id, global_config)
+            remove_cache_dir(config.kernel_eval_build_dir, config.model_name, iteration_num, sample_id, config)
             return (iteration_num, sample_id, response, kernel_src, tokens, original_code, False, stdout)
     except Exception as e:
         logging.error(f"Exception during compilation for Iteration {iteration_num}, Sample ID: {sample_id}: {e}")
-        remove_cache_dir(global_config.kernel_eval_build_dir, global_config.model_name, iteration_num, sample_id, global_config)
-        return (iteration_num, sample_id, response, kernel_src, tokens, original_code, False, stdout)
+        remove_cache_dir(config.kernel_eval_build_dir, config.model_name, iteration_num, sample_id, config)
+        return (iteration_num, sample_id, response, kernel_src, tokens, original_code, False, str(e))
 
-def compile_kernel_wrapper(args):
-    prompt, iteration_num, sample_id = args
-    try:
-        return compile_kernel(prompt, iteration_num, sample_id)
-    except Exception as e:
-        logging.error(f"Error compiling kernel for Iteration {iteration_num}, Sample ID: {sample_id}: {e}")
-        return None
-
-def compile_all_kernels(prompt, iteration_num) -> list[tuple[int, int]]:
+# 修改compile_all_kernels函数，不再传递inference_server_fn
+def compile_all_kernels(prompt, iteration_num, config) -> list[tuple[int, int]]:
     """
     Compile all kernels in parallel before evaluation using a single GPU
     Returns a list of successfully compiled kernels
     """
     successful_compilations = []
 
-    with mp.Pool(processes=global_config.sample_num) as pool:
+    with mp.Pool(processes=config.sample_num) as pool:
         async_results = []
-        for sample_id in range(global_config.sample_num):
-            args = (prompt, iteration_num, sample_id)
+        for sample_id in range(config.sample_num):
+            args = (prompt, iteration_num, sample_id, config)  # 不再传递inference_server_fn
             async_result = pool.apply_async(compile_kernel_wrapper, (args,))
             async_results.append((sample_id, async_result))
 
-        for sample_id, async_result in tqdm(async_results, total=global_config.sample_num, desc="Compiling Kernels"):
+        for sample_id, async_result in tqdm(async_results, total=config.sample_num, desc="Compiling Kernels"):
             try:
                 result = async_result.get(timeout=1200)  # 60秒超时
                 if result is not None:
                     successful_compilations.append(result)
             except mp.TimeoutError:
                 logging.error(f"Compilation timed out for sample {sample_id}")
-                remove_cache_dir(global_config.kernel_eval_build_dir, global_config.model_name, iteration_num, sample_id, global_config)
+                remove_cache_dir(config.kernel_eval_build_dir, config.model_name, iteration_num, sample_id, config)
             except Exception as e:
                 logging.error(f"Error compiling kernel for sample {sample_id}: {e}")
-                remove_cache_dir(global_config.kernel_eval_build_dir, global_config.model_name, iteration_num, sample_id, global_config)
+                remove_cache_dir(config.kernel_eval_build_dir, config.model_name, iteration_num, sample_id, config)
 
     return successful_compilations
+
+class TimeoutError(Exception):
+    pass
+
+def timeout_handler(signum, frame):
+    raise TimeoutError("评估超时")
+
+# 将worker函数移到全局作用域
+def isolated_worker(func, args, result_queue):
+    """在隔离的进程中运行函数并处理异常"""
+    try:
+        # 设置CUDA相关环境变量
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+        os.environ["TORCH_USE_CUDA_DSA"] = "1"
+        
+        # 运行目标函数
+        result = func(*args)
+        
+        # 将结果放入队列
+        result_queue.put(("success", result))
+    except Exception as e:
+        # 捕获异常并放入队列
+        error_str = str(e)
+        result_queue.put(("error", error_str))
+        
+        # 对CUDA错误进行特殊处理
+        if "CUDA" in error_str or "cuda" in error_str or "illegal memory access" in error_str:
+            try:
+                # 尝试恢复GPU状态
+                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    device_id = 0  # 假设使用设备0
+                    torch.cuda.reset_peak_memory_stats(device_id)
+                    torch.cuda.synchronize(device_id)
+                time.sleep(5)  # 给GPU一些恢复时间
+            except:
+                time.sleep(5)
+                pass
+
+def run_isolated_process(func, args, timeout=120):
+    """
+    在完全隔离的进程中运行函数，确保CUDA异常不会影响主进程
+    使用进程间通信来传递结果
+    """
+    # 创建一个队列用于进程间通信
+    result_queue = mp.Queue()
+    
+    # 创建并启动隔离进程，使用全局worker函数
+    process = mp.Process(target=isolated_worker, args=(func, args, result_queue))
+    process.daemon = True  # 设置为守护进程，确保主进程退出时它也会退出
+    process.start()
+    
+    # 使用超时机制等待结果
+    try:
+        # 等待结果，设置超时
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(timeout)
+        
+        try:
+            status, result = result_queue.get()
+            # 取消超时信号
+            signal.alarm(0)
+            
+            # 等待进程结束
+            process.join(1)
+            if process.is_alive():
+                # 如果进程仍然存活，强制终止
+                process.terminate()
+                process.join(1)
+                if process.is_alive():
+                    process.kill()
+            
+            if status == "success":
+                return result
+            else:
+                raise Exception(result)
+        except (mp.queues.Empty, queue.Empty):
+            # 队列为空，可能是进程崩溃
+            raise TimeoutError("进程可能崩溃")
+        finally:
+            # 确保取消超时信号
+            signal.alarm(0)
+            
+    except TimeoutError:
+        # 超时处理
+        logging.error("评估超时，正在终止进程...")
+        
+        # 终止进程
+        if process.is_alive():
+            process.terminate()
+            process.join(1)
+            if process.is_alive():
+                process.kill()
+        
+        # 清理GPU状态
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(0)
+            time.sleep(2)  # 给GPU一些恢复时间
+        except Exception as e:
+            time.sleep(2)
+            logging.warning(f"清理GPU状态失败: {str(e)}")
+        
+        raise TimeoutError("评估超时")
 
 class KernelAgent:
     def __init__(self, config: EvalConfig):
@@ -170,17 +356,100 @@ class KernelAgent:
         self.iteration_num = 0
         self.output_dir = os.path.join(self.config.logdir, self.config.model_name, f"level_{self.config.level}", f"problem_{self.config.problem_id}")
         self.num_inferences = 3  # 新增：每次迭代生成的推理次数
+        # 创建进程池，在整个生命周期内重用
+        self.process_pool = ProcessPoolExecutor(max_workers=3)  # 限制并发数量
+        self.plan_num = 5
+
+    def __del__(self):
+        # 确保进程池在对象销毁时关闭
+        if hasattr(self, 'process_pool'):
+            self.process_pool.shutdown()
 
     def initialize_server(self, inference_server):
         self.inference_server = inference_server
     
     def initialize_plan_server(self, plan_server):
         self.plan_server = plan_server
+    
+    def initialize_plan_evaluator(self, plan_evaluator):
+        self.plan_evaluator = plan_evaluator
 
     def initialize_prompt(self, prompt):
         self.init_prompt = prompt
         self.current_prompt = prompt
         self.prompts.append(prompt)
+
+    def generate_plans_in_parallel(self, plan_prompt, num_plans=5):
+        """
+        并行生成多个计划
+        
+        Args:
+            plan_prompt: 用于生成计划的提示
+            num_plans: 要生成的计划数量
+            
+        Returns:
+            生成的计划列表和对应的token数量
+        """
+        plans = []
+        tokens_list = []
+        
+        # 准备工作进程的参数
+        args_list = [(
+            plan_prompt, 
+            self.config.plan_server_type, 
+            self.config.plan_model_name, 
+            self.config.temperature, 
+            self.config.max_tokens, 
+            self.config.verbose, 
+            self.config.archon_config_path, 
+            60
+        ) for _ in range(num_plans)]
+        
+        # 使用进程池并行生成计划
+        with ProcessPoolExecutor(max_workers=num_plans) as executor:
+            futures = [executor.submit(generate_plan_worker, *args) for args in args_list]
+            
+            # 收集结果
+            for future in tqdm(concurrent.futures.as_completed(futures), total=num_plans, desc="生成计划"):
+                try:
+                    plan, tokens = future.result()
+                    plans.append(plan)
+                    tokens_list.append(tokens)
+                except Exception as e:
+                    logging.error(f"获取计划结果时出错: {str(e)}")
+                    # 如果某个计划生成失败，添加一个空计划
+                    plans.append("")
+                    tokens_list.append(0)
+        
+        return plans, tokens_list
+
+    def evaluate_and_integrate_plans(self, arc_src, kernel_src, plans):
+        """
+        评估多个计划并整合为一个最终计划
+        
+        Args:
+            plans: 要评估的计划列表
+            
+        Returns:
+            整合后的最终计划和使用的token数量
+        """
+        if not plans or all(not plan for plan in plans):
+            logging.warning("没有有效的计划可评估")
+            return "", 0
+        
+        # 构建评估提示
+        eval_prompt = prompt_generate_plan_evaluation(arc_src, kernel_src, plans)
+        
+        # 使用评估服务器评估计划
+        final_plan, tokens = self.plan_evaluator(eval_prompt)
+        plan_path = os.path.join(self.config.logdir, self.config.model_name, f"level_{self.config.level}", f"problem_{self.config.problem_id}", f"iteration_{self.iteration_num}")
+        if not os.path.exists(plan_path):
+            os.makedirs(plan_path, exist_ok=True)
+        with open(os.path.join(plan_path, f"plan_evaluation.txt"), "w") as f:
+            f.write(final_plan)
+        final_plan = parser_plan_evaluation(final_plan)
+
+        return final_plan, tokens
 
     def refine_prompt(self):
         first_step_flag = True if self.iteration_num == 0 else False
@@ -212,11 +481,22 @@ class KernelAgent:
                 hist_results = hist_results + [self.results[i] for i in sort_idx][-self.config.hist_num:]
 
             if self.config.plan_flag and not first_step_flag:
-                plan_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=True, plan=self.plan)
-                self.plan, plan_tokens = self.plan_server(plan_prompt)
-                self.plan_tokens = plan_tokens
+                # 生成计划提示
+                plan_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(
+                    self.ref_arch_src, hist_codes, hist_results, 
+                    self.config.recent_hist_flag, self.config.best_hist_flag, 
+                    example_flag=example_flag, plan_flag=self.config.plan_flag, 
+                    first_step_flag=first_step_flag, generate_plan_flag=True, plan=self.plan
+                )
+                
+                # 并行生成多个计划
+                plans, plan_tokens_list = self.generate_plans_in_parallel(plan_prompt, num_plans=self.config.plan_num)
+                
+                # 评估和整合计划
+                self.plan, plan_tokens = self.evaluate_and_integrate_plans(self.ref_arch_src, hist_codes[-1], plans) if self.config.plan_num > 1 else (plans[0], plan_tokens_list[0])
+                self.plan_tokens = plan_tokens + sum(plan_tokens_list)
                 self.plan_prompt = plan_prompt
-
+            
             if self.config.reflection:
                 if not self.config.best_hist_flag:
                     improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan)
@@ -229,8 +509,13 @@ class KernelAgent:
         self.prompts.append(self.current_prompt)
 
     def get_code_and_compile(self):
-        compile_results = compile_all_kernels(self.current_prompt, self.iteration_num)
+        compile_results = compile_all_kernels(self.current_prompt, self.iteration_num, self.config)
         results = []
+        
+        # 创建一个字典来存储每个sample_id的评估结果
+        sample_results = {}
+        
+        # 准备评估参数
         eval_args = []
         for cr in compile_results:
             problem_id, sample_id, response, code, tokens, original_code, successful_flag, error = cr
@@ -244,48 +529,79 @@ class KernelAgent:
                     f"{sample_id}"
                 )
                 eval_args.append([
-                    '--ref_arch_src', self.ref_arch_src,
-                    '--code', code,
-                    '--build_dir', build_dir,
-                    '--device_id', str(self.config.device_id),
-                    '--verbose', str(int(self.config.verbose)),
-                    '--num_correct_trials', '5',  # num_correct_trials
-                    '--num_perf_trials', '50'  # num_perf_trials
+                    self.ref_arch_src,
+                    code,
+                    build_dir,
+                    0,  # 使用设备0，因为我们已经设置了CUDA_VISIBLE_DEVICES
+                    self.config.verbose,
+                    3,
+                    30,
+                    sample_id
                 ])
         
-        eval_results = []
-        for eval_arg in tqdm(eval_args):
-            cmd = ['python3', 'scripts/evaluate_kernel.py'] + eval_arg
+        # 使用进程池进行评估，每个评估任务在独立进程中运行
+        futures = []
+        
+        # 为每个评估任务创建一个新的进程池，确保完全隔离
+        for eval_arg in eval_args:
+            sample_id = eval_arg[-1]
+            eval_arg_without_id = eval_arg[:-1]
+            
             try:
-                # 设置超时时间为60秒
-                _result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-                import re
-                
-                try:
-                    print(f"Evaluation result: {_result.stdout}")
-                    result = re.findall('(\{\"iteration\":.+\})\n', _result.stdout)[0]
-                    result = json.loads(result)
-                    eval_results.append(result)
-                except Exception as e:
-                    logging.error(f"Failed to parse result: {str(e)}")
-                    import pdb; pdb.set_trace()
-            except subprocess.TimeoutExpired:
-                logging.error("Subprocess timed out")
-                eval_results.append({
-                    "iteration": -1,
+                result = run_isolated_process(evaluate_kernel_isolated, eval_arg_without_id, timeout=60)
+                result_dict = vars(result)
+                result_dict.update({
+                    'sample_id': sample_id,
+                    'plan_tokens': self.plan_tokens,
+                    'inference_tokens': 0
+                })
+                sample_results[sample_id] = result_dict
+            except TimeoutError:
+                error_result = {
+                    "iteration": self.iteration_num,
                     "compiled": True,
                     "correctness": False,
-                    "runtime": -1.0,
+                    "runtime": 0.0,
                     "baseline_runtime": 0.0,
                     "speed_up": 0.0,
-                    "metadata": "error: Subprocess timed out"
-                })
-
+                    "error": "runtime_error",
+                    "metadata": "runtime_error",
+                    "sample_id": sample_id,
+                    "plan_tokens": self.plan_tokens
+                }
+                sample_results[sample_id] = error_result
+            except Exception as e:
+                error_str = str(e)
+                logging.error(f"评估失败 (sample_id={sample_id}): {error_str}")
+                error_result = {
+                    "iteration": self.iteration_num,
+                    "compiled": True,
+                    "correctness": False,
+                    "runtime": 0.0,
+                    "baseline_runtime": 0.0,
+                    "speed_up": 0.0,
+                    "error": error_str,
+                    "metadata": f"{error_str}",
+                    "sample_id": sample_id,
+                    "plan_tokens": self.plan_tokens
+                }
+                sample_results[sample_id] = error_result
+            
+            # 在每次评估后清理GPU状态
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize(0)
+            except Exception as e:
+                logging.warning(f"清理GPU状态失败: {str(e)}")
+        
         # 处理评估结果
-        successful_idx = 0
         for idx, cr in enumerate(compile_results):
             problem_id, sample_id, response, code, tokens, original_code, successful_flag, error = cr
+            
             if not successful_flag:
+                # 编译失败的样本
+                code = "" if code is None else code
+                response = "" if response is None else response
                 result = {
                     "iteration": self.iteration_num,
                     "compiled": False,
@@ -297,36 +613,52 @@ class KernelAgent:
                     "baseline_runtime": 0.0,
                     "speed_up": 0.0,
                     "metadata": f"{error}"
-                    
                 }
-                result.update({
-                    'iteration': self.iteration_num,
-                    'sample_id': sample_id,
-                    'plan_tokens': self.plan_tokens,
-                    'inference_tokens': tokens
-                })
+            else:
+                # 编译成功的样本，使用存储的评估结果
                 
-                results.append(result)
-                self.save_results_single_sample(code, response, result, sample_id)
-                continue
-            eval_result = eval_results[successful_idx]
-            result = eval_result
-            successful_idx += 1
-            # 添加元数据
-            result.update({
-                'iteration': self.iteration_num,
-                'sample_id': sample_id,
-                'plan_tokens': self.plan_tokens,
-                'inference_tokens': tokens
-            })
+                if sample_id in sample_results:
+                    result = sample_results[sample_id]
+                    # 更新token信息
+                    result.update({
+                        'iteration': self.iteration_num,
+                        'sample_id': sample_id,
+                        'plan_tokens': self.plan_tokens,
+                        'inference_tokens': tokens
+                    })
+                else:
+                    # 这种情况不应该发生，但为了健壮性添加
+                    result = {
+                        "iteration": self.iteration_num,
+                        "compiled": True,
+                        "correctness": False,
+                        "sample_id": sample_id,
+                        "plan_tokens": self.plan_tokens,
+                        "inference_tokens": tokens,
+                        "runtime": -1.0,
+                        "baseline_runtime": 0.0,
+                        "speed_up": 0.0,
+                        "error": "未找到评估结果",
+                        "metadata": f"{error}"
+                    }
             
             results.append(result)
             self.save_results_single_sample(code, response, result, sample_id)
         
+        # 找出最佳结果
         result_idxs = range(len(results))
         if len(result_idxs) == 0:
-            return result, code, response, original_code
-        result = min(results, key=lambda result: result['runtime'] if 'correctness' in result and result['correctness'] else float('inf'))
+            return None, None, None, None
+        
+        correct_results = [result for result in results if 'correctness' in result and result['correctness']]
+        if len(correct_results) == 0:
+            compiled_results = [result for result in results if 'compiled' in result and result['compiled']]
+            if len(compiled_results) == 0:
+                result = random.choice(results)
+            else:
+                result = results[0]
+        else:
+            result = min(results, key=lambda result: result['runtime'] if 'correctness' in result and result['correctness'] else float('inf'))
         result_id = result['sample_id']
         best_compile_result = [compile_result for compile_result in compile_results if compile_result[1]==result_id][0]
         code = best_compile_result[3]
@@ -436,8 +768,8 @@ class KernelAgent:
             with open(os.path.join(best_dir, "best_code.py"), "w") as f:
                 f.write(self.best_code)
 
-            with open(os.path.join(run_dir, f"level_{self.config.level}_problem_{self.config.problem_id}_sample_0_kernel.py"), "w") as f:
-                f.write(self.best_code)
+            # with open(os.path.join(run_dir, f"level_{self.config.level}_problem_{self.config.problem_id}_sample_0_kernel.py"), "w") as f:
+            #     f.write(self.best_code)
 
     def draw_results(self):
         import matplotlib.pyplot as plt
@@ -461,13 +793,35 @@ class KernelAgent:
         plt.savefig(os.path.join(self.output_dir, "speed_up_plot.png"))
         plt.close()
 
+# 添加工作进程函数，用于生成单个计划
+def generate_plan_worker(prompt, server_type, model_name, temperature, max_tokens, verbose=False, archon_config_path=None, time_generation=False):
+    """
+    工作进程函数，用于生成单个计划
+    """
+    try:
+        # 创建一个新的服务器实例
+        server = SerializablePlanServer(
+            server_type=server_type,
+            model_name=model_name,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            verbose=verbose,
+            archon_config_path=archon_config_path,
+            time_generation=time_generation
+        )
+        # 生成计划
+        return server(prompt)
+    except Exception as e:
+        logging.error(f"生成计划时出错: {str(e)}")
+        return "", 0
+
 @pydra.main(base=EvalConfig)
 def main(config: EvalConfig):
     """
     迭代生成并评估 CUDA 核函数，最终输出最佳结果
     """
     print(f"Starting Eval with config: {config}")
-    global inference_server, global_config
+    global global_config
     global_config = config
 
     # 配置数据集
@@ -520,17 +874,34 @@ def main(config: EvalConfig):
         archon_config_path=config.archon_config_path,
         time_generation=True
     )
+    
+    # 计划生成服务器
     plan_server = create_inference_server_from_presets(
-        server_type=config.server_type,
-        model_name=config.model_name,
+        # server_type=config.server_type,
+        # model_name=config.model_name,
         # server_type="volcengine",
         # model_name="ep-20250214154957-c777d",
+        # server_type=config.server_type,
+        # model_name=config.model_name,
+        server_type="pandas",
+        model_name="gpt-4o-mini",
         temperature=1.0,
         max_tokens=8192,
         verbose=False,
     )
+    
+    # 计划评估服务器
+    plan_evaluator = create_inference_server_from_presets(
+        server_type="pandas",
+        model_name="gpt-4o-mini",
+        temperature=config.temperature,  # 评估时使用较低的温度
+        max_tokens=8192,
+        verbose=False,
+    )
+    
     kernel_agent.initialize_server(inference_server)
     kernel_agent.initialize_plan_server(plan_server)
+    kernel_agent.initialize_plan_evaluator(plan_evaluator)
     kernel_agent.ref_arch_src = ref_arch_src
 
     kernel_agent.refine_prompt()
@@ -560,6 +931,9 @@ def main(config: EvalConfig):
         print(f"No huge improvement~")
 
     shutil.rmtree(config.kernel_eval_build_dir, ignore_errors=True)
+
+    # 强制使用设备0，因为我们已经设置了CUDA_VISIBLE_DEVICES
+    config.device_id = 0
 
 if __name__ == "__main__":
     main()
