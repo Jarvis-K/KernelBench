@@ -317,7 +317,7 @@ Focus only on the most impactful changes.
 """
         return prompt
     
-    def create_improvement_prompt(self, plan):
+    def create_improvement_prompt(self, plan, good_flag=False):
         """创建基于plan改进代码的prompt"""
         prompt = f"""
 You are a CUDA programming and performance optimization expert. Implement the following optimization plan to improve a CUDA kernel.
@@ -329,7 +329,7 @@ Problem description:
 
 Current implementation (Lower performance):
 ```python
-{self.bad_kernel}
+{self.bad_kernel if not good_flag else self.good_kernel}
 ```
 
 Optimization plan:

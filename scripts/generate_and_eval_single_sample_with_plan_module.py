@@ -19,10 +19,10 @@ from datasets import load_dataset
 import time
 
 from src.dataset import construct_kernelbench_dataset
-from src.eval import eval_kernel_against_ref, build_compile_cache
+from src.eval import eval_kernel_against_ref, build_compile_cache, run_kernel_with_ncu
 from src.prompt_constructor import prompt_generate_custom_cuda_from_prompt_template, prompt_generate_custom_cuda_from_prompt_template_reflection, prompt_generate_plan_evaluation, parser_plan_evaluation
 from src.utils import extract_first_code, query_server, set_gpu_arch, read_file, create_inference_server_from_presets
-from evaluate_kernel import evaluate_kernel_wrapper, evaluate_kernel, evaluate_kernel_isolated
+from evaluate_kernel import evaluate_kernel_isolated
 
 # 设置环境变量，限制只使用GPU 1
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # 只使用GPU 1
@@ -87,6 +87,7 @@ class EvalConfig(Config):
         self.plan_num = 5
         self.plan_server_type = "pandas"
         self.plan_model_name = "gpt-4o-mini"
+        self.use_ncu = False
 
     def __repr__(self):
         return f"EvalConfig({self.to_dict()})"
@@ -181,7 +182,7 @@ def compile_kernel_wrapper(args):
             time_generation=True
         )
         response, tokens = inference_server(prompt)
-        kernel_src, original_code = extract_first_code(response, ["python", "cpp"])
+        kernel_src, original_code, _ = extract_first_code(response, ["python", "cpp"])
         success, stdout, error = build_compile_cache(kernel_src, config.verbose, build_dir)
 
         parsered_all_output = list(set(re.findall(r"(error: .*?)\n", stdout, re.DOTALL | re.MULTILINE)))
@@ -359,6 +360,7 @@ class KernelAgent:
         # 创建进程池，在整个生命周期内重用
         self.process_pool = ProcessPoolExecutor(max_workers=3)  # 限制并发数量
         self.plan_num = 5
+        self.ncu_rule_descriptions = None
 
     def __del__(self):
         # 确保进程池在对象销毁时关闭
@@ -486,7 +488,7 @@ class KernelAgent:
                     self.ref_arch_src, hist_codes, hist_results, 
                     self.config.recent_hist_flag, self.config.best_hist_flag, 
                     example_flag=example_flag, plan_flag=self.config.plan_flag, 
-                    first_step_flag=first_step_flag, generate_plan_flag=True, plan=self.plan
+                    first_step_flag=first_step_flag, generate_plan_flag=True, plan=self.plan, ncu_rule_descriptions=self.ncu_rule_descriptions
                 )
                 
                 # 并行生成多个计划
@@ -499,9 +501,9 @@ class KernelAgent:
             
             if self.config.reflection:
                 if not self.config.best_hist_flag:
-                    improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan)
+                    improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan, ncu_rule_descriptions=self.ncu_rule_descriptions)
                 else:
-                    improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan)
+                    improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan, ncu_rule_descriptions=self.ncu_rule_descriptions)
             else:
                 improvement_prompt = prompt_generate_custom_cuda_from_prompt_template(self.ref_arch_src)
 
@@ -536,6 +538,7 @@ class KernelAgent:
                     self.config.verbose,
                     3,
                     30,
+                    True if self.config.use_ncu and self.config.sample_num == 1 else False,
                     sample_id
                 ])
         
@@ -661,6 +664,27 @@ class KernelAgent:
             result = min(results, key=lambda result: result['runtime'] if 'correctness' in result and result['correctness'] else float('inf'))
         result_id = result['sample_id']
         best_compile_result = [compile_result for compile_result in compile_results if compile_result[1]==result_id][0]
+        if 'correctness' in result and result['correctness'] and self.config.use_ncu:
+            device = torch.device(f"cuda:{self.config.device_id}")
+            build_dir = os.path.join(
+                    self.config.kernel_eval_build_dir, 
+                    "eval_single_sample", 
+                    self.config.model_name, 
+                    f"{self.config.problem_id}",
+                    f"{self.iteration_num}",
+                    f"{result['sample_id']}"
+                )
+            ncu_log_path = os.path.join(
+                self.output_dir,
+                f"iteration_{self.iteration_num}",
+                f"ncu_logs",
+            )
+            if not os.path.exists(ncu_log_path):
+                os.makedirs(ncu_log_path, exist_ok=True)
+            self.ncu_rule_descriptions = run_kernel_with_ncu(self.ref_arch_src, best_compile_result[3], build_dir=build_dir, device=device, ncu_log_path=ncu_log_path)
+        else:
+            self.ncu_rule_descriptions = ""
+        result['ncu_rule_descriptions'] = self.ncu_rule_descriptions
         code = best_compile_result[3]
         response = best_compile_result[2]
         original_code = best_compile_result[5]

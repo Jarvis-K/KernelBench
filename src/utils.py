@@ -595,27 +595,40 @@ def remove_code_block_header(code, code_language_type):
     return code
 
 
+def extract_kernel_name(code):
+    """
+    提取CUDA kernel名称
+    """
+    kernel_name = re.search(r"__global__\s+void\s+(\w+)", code, re.DOTALL)
+    return kernel_name.group(1) if kernel_name else None
+
 def extract_first_code(output_string: str, code_language_types: list[str]) -> str:
     """
-    Extract first code block from model output, specified by code_language_type
+    提取模型输出中的第一个代码块，由code_language_type指定
+    同时尝试提取CUDA kernel名称
     """
     trimmed = output_string.strip()
 
-    # Extracting the first occurrence of content between backticks
+    # 提取第一个出现在反引号之间的内容
     code_match = re.search(r"```(.*?)```", trimmed, re.DOTALL)
 
     if code_match:
-        # Strip leading and trailing whitespace from the extracted code
+        # 去除提取的代码前后的空白
         code = code_match.group(1).strip()
 
-        # depends on code_language_type: cpp, python, etc.
-        # sometimes the block of code is ```cpp ... ``` instead of ``` ... ```
-        # in this case strip the cpp out
+        # 根据code_language_type: cpp, python等处理
+        # 有时代码块是```cpp ... ```而不是``` ... ```
+        # 这种情况下去掉cpp
         for code_type in code_language_types:
             if code.startswith(code_type):
                 code = code[len(code_type) :].strip()
 
+        # 提取模块名称
         module_name = re.search(r"name\s*=\s*['\"](.*?)['\"],", code, re.DOTALL)
+        
+        # 尝试提取CUDA kernel名称
+        kernel_name = re.search(r"__global__\s+void\s+(\w+)", code, re.DOTALL)
+        kernel_name = kernel_name.group(1) if kernel_name else None
 
         if "if __name__ ==" in code:
             code = code.split("if __name__ ==")[0]
@@ -632,11 +645,11 @@ def extract_first_code(output_string: str, code_language_types: list[str]) -> st
                 f'name="{modify_module_name}"',
                 code
             )
-            return modify_code, code
+            return modify_code, code, kernel_name
         else:
-            return "", code
+            return "", code, kernel_name
 
-    return None
+    return None, None, None
 
 
 def extract_last_code(output_string: str, code_language_types: list[str]) -> str | None:

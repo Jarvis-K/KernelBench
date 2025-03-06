@@ -17,6 +17,7 @@ import threading
 from . import utils
 import re
 import time
+import csv
 
 REPO_TOP_PATH = os.path.abspath(
     os.path.join(
@@ -92,6 +93,7 @@ class KernelExecResult(BaseModel):
     baseline_runtime_stats: dict = {}  # only recorded if we decide to measure performance
     speed_up: float = 0.0  # only recorded if we decide to measure performance
     tokens: int = 0
+    ncu_rule_descriptions: str = ""  # 新增字段，存储NCU规则描述
 
 
 def load_original_model_and_inputs(
@@ -316,6 +318,8 @@ def eval_kernel_against_ref(
     measure_performance: bool = False,
     build_dir: os.PathLike = None,
     device: torch.device = torch.cuda.current_device() if torch.cuda.is_available() else None, # have to run on GPU
+    use_ncu: bool = False,
+    ncu_log_path: os.PathLike = None,
 ) -> KernelExecResult:
     """
     Evaluate the custom kernel against the original model
@@ -347,7 +351,10 @@ def eval_kernel_against_ref(
     )
     metadata = {}  # for storing result metadata
     metadata["hardware"] = torch.cuda.get_device_name(device=device)
-    metadata["device"] = str(device)  # for debugging
+    metadata["device"] = str(device)  # 用于调试
+    
+    # 尝试提取CUDA kernel名称
+    kernel_name = utils.extract_kernel_name(custom_model_src)
     
     try:
         set_seed(seed_num)  # set seed for reproducible input
@@ -397,7 +404,7 @@ def eval_kernel_against_ref(
                 compiled=False, metadata=metadata
             )  # skip further steps
 
-    # at this point we passed compilation
+    # 此时我们已通过编译
     try:
         with torch.no_grad():
             set_seed(seed_num)  # set seed for reproducible weights
@@ -464,6 +471,13 @@ def eval_kernel_against_ref(
                 model_new = custom_model.cuda(device=device)
                 torch.cuda.synchronize(device=device)
 
+                # # 如果有kernel_name，创建一个可运行的Python文件用于ncu分析
+                # if use_ncu:
+                #     ncu_rule_descriptions = run_kernel_with_ncu(original_model_src, custom_model_src, seed_num, verbose, build_dir, device, ncu_log_path)
+                #     if ncu_rule_descriptions:
+                #         metadata["ncu_rule_descriptions"] = ncu_rule_descriptions
+                #     kernel_exec_result.ncu_rule_descriptions = ncu_rule_descriptions
+
                 elapsed_times = time_execution_with_cuda_event(
                     model_new,
                     *inputs,
@@ -508,6 +522,105 @@ def eval_kernel_against_ref(
         
     return kernel_exec_result
 
+def run_kernel_with_ncu(original_model_src: str,
+    custom_model_src: str,
+    seed_num: int = 42,
+    verbose: bool = False,
+    build_dir: os.PathLike = None,
+    device: torch.device = torch.cuda.current_device() if torch.cuda.is_available() else None, # have to run on GPU
+    ncu_log_path: os.PathLike = None,
+):
+    kernel_name = utils.extract_kernel_name(custom_model_src)
+    kernel_py_path = os.path.join(ncu_log_path, f"{kernel_name}.py")
+    if not build_dir:
+        build_dir = None
+    else:
+        build_dir = f"\"{build_dir}\""
+    with open(kernel_py_path, "w") as f:
+        f.write(f"""
+import torch
+import sys
+sys.path.append("{os.path.dirname(ncu_log_path)}")
+sys.path.append("{REPO_TOP_PATH}")
+from src.eval import load_original_model_and_inputs, load_custom_model, set_seed
+
+# 加载原始模型和自定义模型
+original_model_src = '''{original_model_src}'''
+custom_model_src = '''{custom_model_src}'''
+
+context = {{}}
+Model, get_init_inputs, get_inputs = load_original_model_and_inputs(original_model_src, context)
+ModelNew = load_custom_model(custom_model_src, context, {build_dir})
+
+# 设置种子并获取输入
+set_seed({seed_num})
+init_inputs = get_init_inputs()
+init_inputs = [x.cuda(device="{device}") if isinstance(x, torch.Tensor) else x for x in init_inputs]
+
+# 创建模型实例
+custom_model = ModelNew(*init_inputs).to("{device}")
+
+# 获取输入数据
+set_seed({seed_num})
+inputs = get_inputs()
+inputs = [x.cuda(device="{device}") if isinstance(x, torch.Tensor) else x for x in inputs]
+
+# 运行模型
+with torch.no_grad():
+    for _ in range(2):  # 运行多次以确保内核被调用
+        output = custom_model(*inputs)
+        torch.cuda.synchronize(device="{device}")
+print("Completed running")
+""")
+    
+    # 运行ncu命令进行性能分析
+    ncu_output_path = os.path.join(ncu_log_path, "output")
+    ncu_cmd = f'ncu --set full -o {ncu_output_path} -f --kernel-name "{kernel_name}" python {kernel_py_path}'
+    
+    try:
+        subprocess.run(ncu_cmd, shell=True, check=True)
+        
+        # 将ncu报告转换为CSV
+        csv_output_path = os.path.join(ncu_log_path, "output.csv")
+        ncu_csv_cmd = f"ncu -i {ncu_output_path}.ncu-rep -f --page details --csv --log-file {csv_output_path}"
+        subprocess.run(ncu_csv_cmd, shell=True, check=True)
+        
+        # 读取CSV文件中的Rule Description
+        rule_descriptions = []
+        speedup_data = []
+        
+        # 收集所有global类型的优化建议
+        with open(csv_output_path, 'r') as csvfile:
+            reader = csv.DictReader(csvfile)
+            
+            for row in reader:
+                if 'Rule Description' in row and row['Rule Description'] and row['Rule Description'].strip():
+                    if 'Estimated Speedup Type' in row and row['Estimated Speedup Type'] == 'global':
+                        try:
+                            # 尝试提取Estimated Speedup值并转换为浮点数
+                            speedup = float(row.get('Estimated Speedup', '0').replace('x', ''))
+                            speedup_data.append({
+                                'description': row['Rule Description'].strip(),
+                                'speedup': speedup
+                            })
+                        except (ValueError, TypeError):
+                            # 如果无法转换为浮点数，则使用0作为默认值
+                            speedup_data.append({
+                                'description': row['Rule Description'].strip(),
+                                'speedup': 0.0
+                            })
+        # 根据speedup值排序（从高到低）
+        speedup_data.sort(key=lambda x: x['speedup'], reverse=True)
+        
+        # 提取排序后的描述
+        rule_descriptions = [f"{item['description']}" for item in speedup_data][:1]
+        
+        # 将规则描述添加到元数据
+        return '\n'.join(rule_descriptions)
+    except Exception as e:
+        if verbose:
+            print(f"[评估] 运行NCU命令时出错: {e}")
+        return None
 
 def register_and_format_exception(
     exception_type: str,

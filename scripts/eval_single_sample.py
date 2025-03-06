@@ -44,6 +44,8 @@ class EvalConfig(Config):
         # Logging
         self.logdir = os.path.join(REPO_TOP_DIR, "results/eval_logs")
         self.verbose = False
+        self.use_ncu = False
+        self.ncu_log_path = None
 
     def __repr__(self):
         return f"EvalConfig({self.to_dict()})"
@@ -66,7 +68,9 @@ class KernelAgent:
             measure_performance=True,
             num_correct_trials=num_correct_trials,
             num_perf_trials=num_perf_trials,
-            device = torch.device(f"cuda:{self.config.device_id}")
+            device = torch.device(f"cuda:{self.config.device_id}"),
+            use_ncu=self.config.use_ncu,
+            ncu_log_path=self.config.ncu_log_path
         )
         result = vars(result)
         return result
