@@ -14,6 +14,7 @@ import queue
 import signal
 import re
 import random
+import copy
 
 from datasets import load_dataset
 import time
@@ -88,6 +89,10 @@ class EvalConfig(Config):
         self.plan_server_type = "pandas"
         self.plan_model_name = "gpt-4o-mini"
         self.use_ncu = False
+        # 添加新参数，控制是否先获取编译正确且运行正确的代码
+        self.get_correct_code_first = False
+        # 用于控制初始化KernelAgent时的sample_num序列
+        self.sample_num_sequence = [1, 2, 4, 8, 16]
 
     def __repr__(self):
         return f"EvalConfig({self.to_dict()})"
@@ -361,6 +366,8 @@ class KernelAgent:
         self.process_pool = ProcessPoolExecutor(max_workers=3)  # 限制并发数量
         self.plan_num = 5
         self.ncu_rule_descriptions = None
+        # 添加保存编译结果的属性
+        self.compile_results = []
 
     def __del__(self):
         # 确保进程池在对象销毁时关闭
@@ -512,6 +519,9 @@ class KernelAgent:
 
     def get_code_and_compile(self):
         compile_results = compile_all_kernels(self.current_prompt, self.iteration_num, self.config)
+        # 保存编译结果
+        self.compile_results = compile_results
+        
         results = []
         
         # 创建一个字典来存储每个sample_id的评估结果
@@ -839,6 +849,194 @@ def generate_plan_worker(prompt, server_type, model_name, temperature, max_token
         logging.error(f"生成计划时出错: {str(e)}")
         return "", 0
 
+def get_correct_code(config, ref_arch_src, problem_name):
+    """
+    尝试获取一个编译正确且运行正确的代码
+    
+    Args:
+        config: 配置对象
+        ref_arch_src: 参考架构源代码
+        problem_name: 问题名称
+        
+    Returns:
+        correct_code: 正确的代码
+        result: 评估结果
+        ncu_rule_descriptions: NCU优化建议
+    """
+    print("尝试获取编译正确且运行正确的代码...")
+    
+    # 如果给定了example_code，直接使用它
+    if config.given_example_code is not None and os.path.exists(config.given_example_code):
+        with open(config.given_example_code, "r") as f:
+            correct_code = f.read()
+            
+        # 评估给定的代码
+        device = torch.device(f"cuda:{config.device_id}")
+        build_dir = os.path.join(config.kernel_eval_build_dir, "correct_code_eval")
+        os.makedirs(build_dir, exist_ok=True)
+        
+        # 编译并评估代码
+        success, stdout, error = build_compile_cache(correct_code, config.verbose, build_dir)
+        if not success:
+            print(f"给定的example_code编译失败: {error}")
+            return None, None, None
+            
+        # 评估代码性能
+        try:
+            eval_result = eval_kernel_against_ref(ref_arch_src, correct_code, build_dir=build_dir, device=device, verbose=config.verbose)
+            
+            # 如果需要NCU分析
+            ncu_log_path = os.path.join(config.logdir, config.model_name, 
+                                      f"level_{config.level}", f"problem_{config.problem_id}", 
+                                      "correct_code_ncu_logs")
+            os.makedirs(ncu_log_path, exist_ok=True)
+            
+            if config.use_ncu and eval_result.correctness:
+                ncu_rule_descriptions = run_kernel_with_ncu(ref_arch_src, correct_code, 
+                build_dir=build_dir, 
+                device=device, 
+                ncu_log_path=ncu_log_path)
+            else:
+                ncu_rule_descriptions = ""
+                
+            # 构建结果字典
+            result = {
+                "iteration": -1,  # 使用-1表示这是预先获取的正确代码
+                "compiled": True,
+                "correctness": eval_result.correctness,
+                "runtime": eval_result.runtime,
+                "baseline_runtime": eval_result.baseline_runtime,
+                "speed_up": eval_result.baseline_runtime / eval_result.runtime if eval_result.runtime > 0 else 0.0,
+                "error": "",
+                "metadata": "",
+                "sample_id": 0,
+                "plan_tokens": 0,
+                "inference_tokens": 0,
+                "ncu_rule_descriptions": ncu_rule_descriptions
+            }
+            
+            return correct_code, result, ncu_rule_descriptions
+        except Exception as e:
+            print(f"评估给定的example_code时出错: {str(e)}")
+            return None, None, None
+    
+    # 如果没有给定example_code，初始化一个KernelAgent来寻找正确的代码
+    print("没有给定example_code，将尝试生成正确的代码...")
+    
+    # 保存原始sample_num
+    original_sample_num = config.sample_num
+    
+    # 创建一个临时配置对象用于寻找正确代码
+    temp_config = copy.deepcopy(config)
+    temp_config.logdir = os.path.join(config.logdir, "temp_correct_code_search")
+    
+    # 初始化一个临时KernelAgent
+    temp_agent = KernelAgent(temp_config)
+    
+    # 初始化推理服务器
+    inference_server = create_inference_server_from_presets(
+        server_type=config.server_type,
+        model_name=config.model_name,
+        temperature=config.temperature,
+        max_tokens=config.max_tokens,
+        verbose=config.verbose,
+        archon_config_path=config.archon_config_path,
+        time_generation=True
+    )
+    
+    # 计划生成服务器
+    plan_server = create_inference_server_from_presets(
+        server_type="pandas",
+        model_name="gpt-4o-mini",
+        temperature=1.0,
+        max_tokens=8192,
+        verbose=False,
+    )
+    
+    # 计划评估服务器
+    plan_evaluator = create_inference_server_from_presets(
+        server_type="pandas",
+        model_name="gpt-4o-mini",
+        temperature=config.temperature,
+        max_tokens=8192,
+        verbose=False,
+    )
+    
+    temp_agent.initialize_server(inference_server)
+    temp_agent.initialize_plan_server(plan_server)
+    temp_agent.initialize_plan_evaluator(plan_evaluator)
+    temp_agent.ref_arch_src = ref_arch_src
+    
+    # 尝试不同的sample_num
+    for sample_num in config.sample_num_sequence:
+        print(f"尝试使用sample_num={sample_num}生成正确代码...")
+        temp_config.sample_num = sample_num
+        temp_agent.config = temp_config
+        
+        # 生成并评估代码
+        temp_agent.refine_prompt()
+        temp_agent.get_results(ref_arch_src, num_correct_trials=5, num_perf_trials=100, verbose=config.verbose)
+        
+        # 检查是否有正确的代码
+        correct_results = [r for r in temp_agent.results if r.get('correctness', False)]
+        if correct_results:
+            # 找到了正确的代码
+            best_result = min(correct_results, key=lambda r: r['runtime'])
+            best_sample_id = best_result['sample_id']
+            
+            # 获取对应的代码
+            for cr in temp_agent.compile_results:
+                if cr[1] == best_sample_id:  # sample_id匹配
+                    correct_code = cr[3]  # 代码在索引3
+                    break
+            
+            # 如果需要NCU分析
+            ncu_rule_descriptions = ""
+            if config.use_ncu:
+                try:
+                    device = torch.device(f"cuda:{config.device_id}")
+                    build_dir = os.path.join(
+                        config.kernel_eval_build_dir, 
+                        "eval_single_sample", 
+                        config.model_name, 
+                        f"{config.problem_id}",
+                        f"{temp_agent.iteration_num-1}",
+                        f"{best_sample_id}"
+                    )
+                    
+                    ncu_log_path = os.path.join(
+                        temp_config.logdir,
+                        f"ncu_logs",
+                    )
+                    os.makedirs(ncu_log_path, exist_ok=True)
+                    
+                    ncu_rule_descriptions = run_kernel_with_ncu(
+                        ref_arch_src, correct_code, 
+                        build_dir=build_dir, device=device, 
+                        ncu_log_path=ncu_log_path
+                    )
+                    best_result['ncu_rule_descriptions'] = ncu_rule_descriptions
+                except Exception as e:
+                    print(f"运行NCU分析时出错: {str(e)}")
+            
+            # 恢复原始sample_num
+            config.sample_num = original_sample_num
+            
+            # 清理临时目录
+            if os.path.exists(temp_config.logdir):
+                shutil.rmtree(temp_config.logdir, ignore_errors=True)
+                
+            return correct_code, best_result, ncu_rule_descriptions
+    
+    # 如果所有尝试都失败，恢复原始sample_num并返回None
+    config.sample_num = original_sample_num
+    
+    # 清理临时目录
+    if os.path.exists(temp_config.logdir):
+        shutil.rmtree(temp_config.logdir, ignore_errors=True)
+        
+    return None, None, None
+
 @pydra.main(base=EvalConfig)
 def main(config: EvalConfig):
     """
@@ -883,6 +1081,31 @@ def main(config: EvalConfig):
     assert problem_number == config.problem_id, (
         f"Problem number in filename ({problem_number}) does not match config problem_id ({config.problem_id})"
     )
+    
+    # 如果需要先获取正确的代码
+    correct_code = None
+    correct_result = None
+    ncu_rule_descriptions = None
+    
+    if config.get_correct_code_first:
+        correct_code, correct_result, ncu_rule_descriptions = get_correct_code(config, ref_arch_src, problem_name)
+        if correct_code:
+            print("成功获取编译正确且运行正确的代码!")
+            # 保存正确的代码到文件
+            correct_code_dir = os.path.join(config.logdir, config.model_name, 
+                                          f"level_{config.level}", f"problem_{config.problem_id}", 
+                                          "correct_code")
+            os.makedirs(correct_code_dir, exist_ok=True)
+            with open(os.path.join(correct_code_dir, "code.py"), "w") as f:
+                f.write(correct_code)
+            with open(os.path.join(correct_code_dir, "result.json"), "w") as f:
+                json.dump(correct_result, f, indent=4)
+            if ncu_rule_descriptions:
+                with open(os.path.join(correct_code_dir, "ncu_rules.txt"), "w") as f:
+                    f.write(ncu_rule_descriptions)
+        else:
+            print("未能获取编译正确且运行正确的代码，将继续正常流程。")
+    
     kernel_agent = KernelAgent(config)
     # 如果存在结果文件夹，先删除
     if os.path.exists(kernel_agent.output_dir):
@@ -901,12 +1124,6 @@ def main(config: EvalConfig):
     
     # 计划生成服务器
     plan_server = create_inference_server_from_presets(
-        # server_type=config.server_type,
-        # model_name=config.model_name,
-        # server_type="volcengine",
-        # model_name="ep-20250214154957-c777d",
-        # server_type=config.server_type,
-        # model_name=config.model_name,
         server_type="pandas",
         model_name="gpt-4o-mini",
         temperature=1.0,
@@ -927,25 +1144,24 @@ def main(config: EvalConfig):
     kernel_agent.initialize_plan_server(plan_server)
     kernel_agent.initialize_plan_evaluator(plan_evaluator)
     kernel_agent.ref_arch_src = ref_arch_src
-
-    kernel_agent.refine_prompt()
+    
+    # 如果有正确的代码和NCU规则，更新到kernel_agent
+    if correct_code and correct_result:
+        kernel_agent.current_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(ref_arch_src, [correct_code], [correct_result], True, True, example_flag=False, plan_flag=config.plan_flag, first_step_flag=False, generate_plan_flag=False, plan=None, ncu_rule_descriptions=ncu_rule_descriptions)
+    else:
+        kernel_agent.refine_prompt()
 
     # 3. 迭代生成和评估
     for i in range(config.max_iteration):
         print(f"Iteration {i+1} / {config.max_iteration}")
         kernel_agent.get_results(ref_arch_src, num_correct_trials=5, num_perf_trials=100, verbose=config.verbose)
         kernel_agent.save_results(iteration_num=i)
-        # print(f"Iteration {i+1} Response:\n{kernel_agent.responses[-1]}")
         print(f"Iteration {i+1} Evaluation:\n{kernel_agent.results[-1]}")
         # 如果不是最后一轮则更新 prompt
         if i < config.max_iteration - 1:
             kernel_agent.refine_prompt()
 
-    # kernel_agent.update_speedup()
     kernel_agent.save_best_results()
-
-    # print(f"Best prompt:\n{kernel_agent.best_prompt}")
-    # print(f"Best response:\n{kernel_agent.best_response}")
     kernel_agent.draw_results()
     print(f"Best evaluation result:\n{kernel_agent.best_result}")
 

@@ -567,7 +567,7 @@ inputs = [x.cuda(device="{device}") if isinstance(x, torch.Tensor) else x for x 
 
 # 运行模型
 with torch.no_grad():
-    for _ in range(2):  # 运行多次以确保内核被调用
+    for _ in range(1):  # 运行多次以确保内核被调用
         output = custom_model(*inputs)
         torch.cuda.synchronize(device="{device}")
 print("Completed running")
@@ -613,10 +613,10 @@ print("Completed running")
         speedup_data.sort(key=lambda x: x['speedup'], reverse=True)
         
         # 提取排序后的描述
-        rule_descriptions = [f"{item['description']}" for item in speedup_data][:1]
+        rule_descriptions = [f"{item['description']}" for item in speedup_data][:3]
         
         # 将规则描述添加到元数据
-        return '\n'.join(rule_descriptions)
+        return '\n\n'.join(rule_descriptions)
     except Exception as e:
         if verbose:
             print(f"[评估] 运行NCU命令时出错: {e}")
