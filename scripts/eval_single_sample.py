@@ -61,6 +61,7 @@ class KernelAgent:
         # 提取首个代码块（指定语言：python 或 cpp）
         # response = extract_first_code(response, ["python", "cpp"])
         # 评估生成的 CUDA 代码
+        import pdb; pdb.set_trace()
         result = eval_kernel_against_ref(
             ref_arch_src,
             response,

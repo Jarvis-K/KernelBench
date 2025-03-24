@@ -20,7 +20,7 @@ import time
 
 from src.dataset import construct_kernelbench_dataset
 from src.eval import eval_kernel_against_ref, build_compile_cache, run_kernel_with_ncu
-from src.prompt_constructor import prompt_generate_custom_cuda_from_prompt_template, prompt_generate_custom_cuda_from_prompt_template_reflection, prompt_generate_plan_evaluation, parser_plan_evaluation
+from src.prompt_constructor import prompt_generate_custom_cuda_from_prompt_template, prompt_generate_custom_cuda_from_prompt_template_reflection, prompt_generate_plan_evaluation, parser_plan_evaluation, prompt_generate_custom_cuda_triton, prompt_generate_custom_cuda_persuado
 from src.utils import extract_first_code, query_server, set_gpu_arch, read_file, create_inference_server_from_presets
 from evaluate_kernel import evaluate_kernel_isolated
 
@@ -84,13 +84,35 @@ class EvalConfig(Config):
         self.prompt_file = None
         self.given_example_result = None
         self.given_example_code = None
-        self.plan_num = 5
+        self.plan_num = 1
         self.plan_server_type = "pandas"
         self.plan_model_name = "gpt-4o-mini"
         self.use_ncu = False
-
+        self.save_best_code = False
+        self.generate_triton_code = False
+        self.generate_persuado_code = False
     def __repr__(self):
         return f"EvalConfig({self.to_dict()})"
+
+def get_valuable_result_from_error(results):
+    valuable_results = []
+    regenerate_persuado_code = False
+    for result in results:
+        if 'metadata' in result and 'correctness_issue' in result['metadata']:
+            valuable_results.append(result)
+            regenerate_persuado_code = True
+    if len(valuable_results) == 0:
+        for result in results:
+            valid_compile_results = [result for result in results if 'metadata' in result and 'CUDA error' not in str(result['metadata']) and result['metadata'] != 'runtime_error']
+            if valid_compile_results:
+                result = min(valid_compile_results, key=lambda result: len(str(result['metadata'])))
+                regenerate_persuado_code = True
+            else:
+                result = random.choice(results)
+                regenerate_persuado_code = True
+    else:
+        result = valuable_results[0]
+    return result, regenerate_persuado_code
 
 def remove_cache_dir(cache_dir: str, model_name: str, iteration_num, sample_id, config: EvalConfig):
     """
@@ -361,6 +383,9 @@ class KernelAgent:
         self.process_pool = ProcessPoolExecutor(max_workers=3)  # 限制并发数量
         self.plan_num = 5
         self.ncu_rule_descriptions = None
+        self.triton_code = None
+        self.persuado_code = None
+        self.regenerate_persuado_code = False
 
     def __del__(self):
         # 确保进程池在对象销毁时关闭
@@ -380,6 +405,27 @@ class KernelAgent:
         self.init_prompt = prompt
         self.current_prompt = prompt
         self.prompts.append(prompt)
+
+    def get_triton_code(self):
+        prompt = prompt_generate_custom_cuda_triton(self.ref_arch_src)
+        code, tokens = self.plan_server(prompt)
+        triton_code_dir = os.path.join(self.config.logdir, self.config.model_name, f"level_{self.config.level}", f"problem_{self.config.problem_id}")
+        if not os.path.exists(triton_code_dir):
+            os.makedirs(triton_code_dir, exist_ok=True)
+        with open(os.path.join(triton_code_dir, "triton_code.py"), "w") as f:
+            f.write(code)
+        return code
+    
+    def get_persuado_code(self, first_step_flag=True, prev_cuda_code=None, prev_result=None, prev_persuado_code=None):
+        prompt = prompt_generate_custom_cuda_persuado(self.ref_arch_src, first_step_flag=first_step_flag, prev_cuda_code=prev_cuda_code, prev_result=prev_result, prev_persuado_code=prev_persuado_code)
+        print(prompt)
+        code, tokens = self.plan_server(prompt)
+        persuado_code_dir = os.path.join(self.config.logdir, self.config.model_name, f"level_{self.config.level}", f"problem_{self.config.problem_id}")
+        if not os.path.exists(persuado_code_dir):
+            os.makedirs(persuado_code_dir, exist_ok=True)
+        with open(os.path.join(persuado_code_dir, f"persuado_code_{self.iteration_num}.txt"), "w") as f:
+            f.write(code)
+        return code
 
     def generate_plans_in_parallel(self, plan_prompt, num_plans=5):
         """
@@ -454,6 +500,8 @@ class KernelAgent:
         return final_plan, tokens
 
     def refine_prompt(self):
+        self.triton_code = self.get_triton_code() if self.config.generate_triton_code and self.triton_code is None else self.triton_code
+        
         first_step_flag = True if self.iteration_num == 0 else False
         example_flag = True if self.iteration_num == 0 else self.config.example_flag
         if self.config.prompt_file is not None and os.path.exists(self.config.prompt_file) and first_step_flag:
@@ -482,13 +530,17 @@ class KernelAgent:
                 hist_codes = hist_codes + [self.original_codes[i] for i in sort_idx][-self.config.hist_num:]
                 hist_results = hist_results + [self.results[i] for i in sort_idx][-self.config.hist_num:]
 
+            if first_step_flag:
+                self.persuado_code = self.get_persuado_code(first_step_flag) if self.config.generate_persuado_code else self.persuado_code
+            else:
+                self.persuado_code = self.get_persuado_code(first_step_flag, hist_codes[0], hist_results[0], self.persuado_code) if self.config.generate_persuado_code and self.regenerate_persuado_code else self.persuado_code
             if self.config.plan_flag and not first_step_flag:
                 # 生成计划提示
                 plan_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(
                     self.ref_arch_src, hist_codes, hist_results, 
                     self.config.recent_hist_flag, self.config.best_hist_flag, 
                     example_flag=example_flag, plan_flag=self.config.plan_flag, 
-                    first_step_flag=first_step_flag, generate_plan_flag=True, plan=self.plan, ncu_rule_descriptions=self.ncu_rule_descriptions
+                    first_step_flag=first_step_flag, generate_plan_flag=True, plan=self.plan, ncu_rule_descriptions=self.ncu_rule_descriptions, triton_code=self.triton_code, persuado_code=self.persuado_code
                 )
                 
                 # 并行生成多个计划
@@ -501,9 +553,9 @@ class KernelAgent:
             
             if self.config.reflection:
                 if not self.config.best_hist_flag:
-                    improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan, ncu_rule_descriptions=self.ncu_rule_descriptions)
+                    improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag or self.regenerate_persuado_code, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan, ncu_rule_descriptions=self.ncu_rule_descriptions, triton_code=self.triton_code, persuado_code=self.persuado_code)
                 else:
-                    improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan, ncu_rule_descriptions=self.ncu_rule_descriptions)
+                    improvement_prompt = prompt_generate_custom_cuda_from_prompt_template_reflection(self.ref_arch_src, hist_codes, hist_results, self.config.recent_hist_flag, self.config.best_hist_flag, example_flag=example_flag or self.regenerate_persuado_code, plan_flag=self.config.plan_flag, first_step_flag=first_step_flag, generate_plan_flag=False, plan=self.plan, ncu_rule_descriptions=self.ncu_rule_descriptions, triton_code=self.triton_code, persuado_code=self.persuado_code)
             else:
                 improvement_prompt = prompt_generate_custom_cuda_from_prompt_template(self.ref_arch_src)
 
@@ -551,7 +603,7 @@ class KernelAgent:
             eval_arg_without_id = eval_arg[:-1]
             
             try:
-                result = run_isolated_process(evaluate_kernel_isolated, eval_arg_without_id, timeout=60)
+                result = run_isolated_process(evaluate_kernel_isolated, eval_arg_without_id, timeout=300)
                 result_dict = vars(result)
                 result_dict.update({
                     'sample_id': sample_id,
@@ -655,13 +707,13 @@ class KernelAgent:
         
         correct_results = [result for result in results if 'correctness' in result and result['correctness']]
         if len(correct_results) == 0:
-            compiled_results = [result for result in results if 'compiled' in result and result['compiled']]
-            if len(compiled_results) == 0:
-                result = random.choice(results)
-            else:
-                result = results[0]
+            # compiled_results = [result for result in results if 'compiled' in result and result['compiled']]
+            result, self.regenerate_persuado_code = get_valuable_result_from_error(results)
         else:
             result = min(results, key=lambda result: result['runtime'] if 'correctness' in result and result['correctness'] else float('inf'))
+            min_baseline_runtime = min([_result["baseline_runtime"] for _result in correct_results])
+            result["speed_up"] = max(min_baseline_runtime / result["runtime"], 0.0)
+            self.regenerate_persuado_code = False
         result_id = result['sample_id']
         best_compile_result = [compile_result for compile_result in compile_results if compile_result[1]==result_id][0]
         if 'correctness' in result and result['correctness'] and self.config.use_ncu:
@@ -792,8 +844,9 @@ class KernelAgent:
             with open(os.path.join(best_dir, "best_code.py"), "w") as f:
                 f.write(self.best_code)
 
-            # with open(os.path.join(run_dir, f"level_{self.config.level}_problem_{self.config.problem_id}_sample_0_kernel.py"), "w") as f:
-            #     f.write(self.best_code)
+            if self.config.save_best_code:
+                with open(os.path.join(run_dir, f"level_{self.config.level}_problem_{self.config.problem_id}_sample_0_kernel.py"), "w") as f:
+                    f.write(self.best_code)
 
     def draw_results(self):
         import matplotlib.pyplot as plt
@@ -901,23 +954,17 @@ def main(config: EvalConfig):
     
     # 计划生成服务器
     plan_server = create_inference_server_from_presets(
-        # server_type=config.server_type,
-        # model_name=config.model_name,
-        # server_type="volcengine",
-        # model_name="ep-20250214154957-c777d",
-        # server_type=config.server_type,
-        # model_name=config.model_name,
-        server_type="pandas",
-        model_name="gpt-4o-mini",
-        temperature=1.0,
+        server_type=config.plan_server_type,
+        model_name=config.plan_model_name,
+        temperature=1.0 if config.plan_num > 1 else 0.1,
         max_tokens=8192,
         verbose=False,
     )
     
     # 计划评估服务器
     plan_evaluator = create_inference_server_from_presets(
-        server_type="pandas",
-        model_name="gpt-4o-mini",
+        server_type=config.plan_server_type,
+        model_name=config.plan_model_name,
         temperature=config.temperature,  # 评估时使用较低的温度
         max_tokens=8192,
         verbose=False,

@@ -50,6 +50,8 @@ PANDAS_API_KEY = os.environ.get("PANDAS_API_KEY")
 VOLCENGINE_API_KEY = os.environ.get("VOLCENGINE_API_KEY")
 SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY")
 HUAWEI_API_URL = os.environ.get("HUAWEI_API_URL")
+BAIDU_API_KEY = os.environ.get("BAIDU_API_KEY")
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
 ########################################################
 # Inference Helpers
 ########################################################
@@ -184,6 +186,14 @@ def query_server(
                 max_retries=3,
             )
             model = model_name
+        case "baidu":
+            client = OpenAI(
+                api_key=BAIDU_API_KEY,
+                base_url="https://qianfan.baidubce.com/v2",
+                timeout=10000000,
+                max_retries=3,
+            )
+            model = model_name
         case "siliconflow-completion":
             client = OpenAI(
                 api_key=SILICONFLOW_API_KEY,
@@ -202,6 +212,14 @@ def query_server(
             model = model_name
         case "huawei":
             client = "huawei"
+            model = model_name
+        case "claude":
+            client = OpenAI(
+                api_key=CLAUDE_API_KEY,
+                base_url="https://api.gptsapi.net",
+                timeout=10000000,
+                max_retries=3,
+            )
             model = model_name
         case _:
             raise NotImplementedError
@@ -274,18 +292,18 @@ def query_server(
             response = client.chat.completions.create(
                     model=model,
                     messages=[
-                    # {"role": "system", "content": system_prompt},
+                    # {"role": "system", "content": "请直接提供答案，无需解释思考过程。"},
                     {"role": "user", "content": prompt},
                 ],
                 stream=False,
                 n=num_completions,
-                max_tokens=max_tokens*2,
+                max_tokens=max_tokens,
                 # do not use temperature or top_p
             )
 
         outputs = [choice.message.content for choice in response.choices]
         tokens = response.usage.total_tokens
-    elif server_type == "openai" or server_type == "pandas":
+    elif server_type == "openai" or server_type == "pandas" or server_type == "claude":
         if (
             "o1" in model
         ):  # o1 does not support system prompt and decode config
@@ -350,6 +368,19 @@ def query_server(
         outputs = response
     # for all other kinds of servers, use standard API
     elif server_type == "volcengine":
+        response = client.chat.completions.create(
+                model=model,
+                messages=[
+                # {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            stream=False,
+            n=num_completions,
+            # max_tokens=max_tokens,
+        )
+        outputs = [choice.message.content for choice in response.choices]
+        tokens = response.usage.total_tokens
+    elif server_type == "baidu":
         response = client.chat.completions.create(
                 model=model,
                 messages=[
@@ -510,6 +541,16 @@ SERVER_PRESETS = {
     },
     "huawei": {
         "model_name": "DeepSeek-R1",
+        "temperature": 0.0,
+        "max_tokens": 8192,
+    },
+    "baidu": {
+        "model_name": "ernie-4.5-8k-preview",
+        "temperature": 0.0,
+        "max_tokens": 8192,
+    },
+    "claude": {
+        "model_name": "claude3.7-sonnet",
         "temperature": 0.0,
         "max_tokens": 8192,
     },

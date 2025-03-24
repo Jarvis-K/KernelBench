@@ -52,7 +52,7 @@ def get_arch_definition(arch_src):
 # PROBLEM_STATEMENT = """You are an expert in CUDA programming and performance optimization. You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups. \n
 #     You have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.\n
 # """
-PROBLEM_STATEMENT = """You are an expert in CUDA programming and performance optimization. Please write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups. You are only limited by your imagination.\n
+PROBLEM_STATEMENT = """You are an expert in CUDA programming and performance optimization. Please write custom CUDA kernels to replace the pytorch operators in the given architecture with fixed hyperparameters to get speedups. You are only limited by your imagination.\n
 """
 # PROBLEM_INSTRUCTION = """
 # Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! \n
@@ -94,8 +94,106 @@ def prompt_generate_custom_cuda(
     prompt += PROBLEM_INSTRUCTION
     return prompt
 
+def prompt_generate_custom_cuda_triton(
+    arc_src, 
+):
+    prompt = f"""
+You are a CUDA and Triton expert tasked with converting PyTorch models to Triton kernels. I'll provide a PyTorch model, and you must implement an equivalent Triton version with identical functionality and correct behavior. Follow these precise requirements:
+
+1. CORE FUNCTIONALITY:
+   - The Triton implementation MUST produce IDENTICAL numerical outputs to the PyTorch model when given the same inputs
+   - Carefully analyze all operations in the PyTorch forward method, especially non-standard operations, edge cases, and tensor dimensionality
+
+2. CODE STRUCTURE:
+   - Implement the Model class with the EXACT SAME interface as the PyTorch version
+   - Rename the forward function to __call__
+   - Maintain the same parameter signatures and return value types
+   - If the original model uses self.parameters, initialize them correctly in __init__
+   - Include proper docstrings explaining your implementation
+
+3. MEMORY AND PERFORMANCE:
+   - Ensure proper memory layout and alignment for all tensors
+   - Carefully handle tensor strides and offsets
+   - Use appropriate block sizes and grid dimensions for optimal performance
+   - Consider memory access patterns to avoid bank conflicts
+   - Handle boundary conditions correctly
+
+4. ERROR PREVENTION:
+   - Test your code implementation mentally with different input shapes
+   - Double-check data types - ensure all conversions preserve numerical precision
+   - Verify that all tensor dimensions are properly handled
+   - Ensure proper handling of edge cases (e.g., small input sizes, non-standard shapes)
+   - Be extremely careful with memory accesses and bounds checking
+
+5. DEBUGGING ASSISTANCE:
+   - Add detailed comments explaining your implementation, especially tricky parts
+   - Identify potential performance bottlenecks and optimization strategies
+   - Include clear error handling for invalid inputs
+
+6. SPECIFIC REQUIREMENTS:
+   - CUDA tensors must be properly handled (device placement, memory operations)
+   - Any operations related to tensor reshaping/transposing must preserve data layout
+   - For reduction operations, ensure correct handling of axes and keepdims
+   - For conv operations, verify padding, strides, and dilation are handled correctly
+   - For operations with broadcasting, ensure the broadcast dimensions are properly handled
+
+7. FINAL VERIFICATION:
+   - Before submitting, mentally trace through the execution with sample inputs
+   - Verify that your implementation will produce the same output values as PyTorch
+   - Ensure no runtime errors will occur with valid inputs of different shapes
+
+Please output the complete Triton code without any unimplemented sections. Do not include any testing code or additional explanations outside of code comments. Name the Python class 'Model' to match the original.
+
+Here is the given Torch model:
+{arc_src}
+"""
+    return prompt
+
+def prompt_generate_custom_cuda_persuado(
+    arc_src, prev_cuda_code=None, prev_result=None, prev_persuado_code=None, first_step_flag=True
+):
+    if first_step_flag:
+        prompt = f"""
+        You are a torch Expert. Please help me, based on the following torch model code, to expand the forward function into pseudocode for subsequent CUDA operator generation. The requirement is to detail the computation down to each individual element operation rather than operating on the entire tensor, and get_init_inputs() is used to provide parameters for model initialization. And please make the persuado code as concise as possible and easily for interpretation.
+        ```python
+        {arc_src}
+        ```
+        Please generate pseudocode according to the following format and do not output any additional text:
+If the data type is a float tensor, set it as float*; if it is an int tensor, set it as int64_t*.
+```
+REQUIRE: forward input parameter data type + parameter name + parameter shape + float* weight (if weight is used) + weight shape
+OUTPUT: output parameter data type + parameter name + parameter shape
+......(element-wise computation logic)
+    ```
+    """
+    else:
+        prompt = f"""
+        You are a torch Expert. Please help me, based on the following torch model code, the previously generated pseudocode, the cuda code generated using the previous pseudocode and the code running results, to modify the pseudocode for getting better performance for subsequent CUDA operator generation. The requirement is to detail the computation down to each individual element operation rather than operating on the entire tensor, and get_init_inputs() is used to provide parameters for model initialization. And please make the persuado code as concise as possible and easily for interpretation.
+        Here is the torch model code:
+        ```python
+        {arc_src}
+        ```
+        Here is the previously generated pseudocode:
+        ```python
+        {prev_persuado_code}
+        ```
+        Here is the cuda code generated using the previous pseudocode:
+        ```python
+        {prev_cuda_code}
+        ```
+        {parser_result(prev_result)}
+        Please generate the modified pseudocode according to the following format and do not output any additional text:
+If the data type is a float tensor, set it as float*; if it is an int tensor, set it as int64_t*.
+```
+REQUIRE: forward input parameter data type + parameter name + parameter shape + float* weight (if weight is used) + weight shape
+OUTPUT: output parameter data type + parameter name + parameter shape
+......(element-wise computation logic)
+```
+"""
+    return prompt
+
 def prompt_generate_custom_cuda_reflection(
-    arc_src, example_arch_src, example_new_arch_src, hist_responses, hist_results, recent_hist_flag, best_hist_flag, plan_flag=False, first_step_flag=True, generate_plan_flag=False, plan=None, ncu_rule_descriptions=None
+    arc_src, example_arch_src, example_new_arch_src, hist_responses, hist_results, recent_hist_flag, best_hist_flag, plan_flag=False, first_step_flag=True, generate_plan_flag=False, plan=None, ncu_rule_descriptions=None, triton_code=None, persuado_code=None
 ):
     prompt = PROBLEM_STATEMENT
 
@@ -118,11 +216,24 @@ def prompt_generate_custom_cuda_reflection(
     ```
     """
 
+    if triton_code:
+        prompt += f"""
+        Here is the generated Triton code as a reference:
+        ```
+        {triton_code}
+        ```
+        """
+    
+    if persuado_code and example_arch_src:
+        prompt += f"""
+        Here is the persuado code for the given architecture as a reference:
+        {persuado_code}
+"""
     # prompt += f"""
     # Here's the information of H100 GPU: 
     # {H100_description}
     # """
-    if hist_results:
+    if hist_results and not example_arch_src:
         if best_hist_flag:
             improvement_prompt = f"Below is the previously generated CUDA kernel code:\n"
             for i, (response, result) in enumerate(zip(hist_responses, hist_results)):
@@ -149,9 +260,15 @@ def prompt_generate_custom_cuda_reflection(
         prompt += f"{ncu_rule_descriptions}\n"
     
     if not plan_flag:
+        if not first_step_flag:
         # if hist_results:
         #     prompt += "Please generate the best CUDA kernel code for the given architecture based on the previous generations with feedbacks and the differences and optimizations between the previously generated codes."
-        prompt += "Please optimize and generate the best CUDA kernel code for the given architecture based on the previous generations with feedbacks. Name your new improved output architecture ModelNew. Output the new code in codeblocks, Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! Please output the complete code in a python code block."
+            if "speed up" in prompt:
+                prompt += "Please optimize and generate the best CUDA kernel code for the given architecture based on the previous generations with feedbacks. Name your new improved output architecture ModelNew. Output the new code in codeblocks, Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! Please output the complete code in a python code block. You should pay a lot of attention to the dimension of the input tensor and the output tensor, the dimensions and data types of the input and output of the generated CUDA kernel must be strictly consistent with the architecture, and you should output the dimension of the input tensor and the output tensor in the according code snippet as comments. If weight is used, copy the module parameters in the original architecture to initialize it. If you use any third-party libraries, please import them correctly at the beginning of the code. Please think step by step and write corresponding comments in each line of kernel code."
+            else:
+                prompt += "Please modify the CUDA kernel code for the given architecture based on the previous generations with error feedbacks. Name your new improved output architecture ModelNew. Output the new code in codeblocks, Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! Please output the complete code in a python code block. You should pay a lot of attention to the dimension of the input tensor and the output tensor, the dimensions and data types of the input and output of the generated CUDA kernel must be strictly consistent with the architecture, and you should output the dimension of the input tensor and the output tensor in the according code snippet as comments. If weight is used, copy the module parameters in the original architecture to initialize it. If you use any third-party libraries, please import them correctly at the beginning of the code. Please think step by step and write corresponding comments in each line of kernel code."
+        else:
+            prompt += "Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional on the given GPU device. Just output the new model code and NO testing code! Please output the complete code in a python code block. You should pay a lot of attention to the dimension of the input tensor and the output tensor, the dimensions and data types of the input and output of the generated CUDA kernel must be strictly consistent with the architecture, and you should output the dimension of the input tensor and the output tensor in the according code snippet as comments. If weight is used, copy the module parameters in the original architecture to initialize it. If you use any third-party libraries, please import them correctly at the beginning of the code. Please think step by step and write corresponding comments in each line of kernel code."
     else:
         if generate_plan_flag:
             if first_step_flag:
@@ -532,7 +649,7 @@ def prompt_generate_custom_cuda_from_prompt_template(ref_arch_src: str) -> str:
 
     return prompt_generate_custom_cuda(arch, example_arch, example_new_arch)
 
-def prompt_generate_custom_cuda_from_prompt_template_reflection(ref_arch_src: str, hist_responses=None, hist_results=None, recent_hist_flag=False, best_hist_flag=False, example_flag=True, plan_flag=False, first_step_flag=True, generate_plan_flag=False, plan=None, ncu_rule_descriptions=None) -> str:
+def prompt_generate_custom_cuda_from_prompt_template_reflection(ref_arch_src: str, hist_responses=None, hist_results=None, recent_hist_flag=False, best_hist_flag=False, example_flag=True, plan_flag=False, first_step_flag=True, generate_plan_flag=False, plan=None, ncu_rule_descriptions=None, triton_code=None, persuado_code=None) -> str:
     """
     Using prompt example (an element-wise addition) for prompt templates
     The most basic form of example just to show LLM the task and the expected output format
@@ -560,7 +677,7 @@ def prompt_generate_custom_cuda_from_prompt_template_reflection(ref_arch_src: st
     example_arch = read_file(example_arch_path) if example_flag else ""
     example_new_arch = read_file(example_new_arch_path) if example_flag else ""
 
-    return prompt_generate_custom_cuda_reflection(arch, example_arch, example_new_arch, hist_responses, hist_results, recent_hist_flag, best_hist_flag, plan_flag, first_step_flag, generate_plan_flag, plan, ncu_rule_descriptions)
+    return prompt_generate_custom_cuda_reflection(arch, example_arch, example_new_arch, hist_responses, hist_results, recent_hist_flag, best_hist_flag, plan_flag, first_step_flag, generate_plan_flag, plan, ncu_rule_descriptions, triton_code, persuado_code)
 
 def prompt_generate_custom_cuda_from_prompt_template_s1(ref_arch_src: str, hist_responses=None, hist_results=None, example_flag=True, wait_responses=None, wait_results=None, model="llama") -> str:
     """

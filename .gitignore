@@ -12,3 +12,4 @@ cache/*
 .env
 test*.py
 test/
+failure_code/

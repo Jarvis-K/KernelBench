@@ -4,6 +4,7 @@ import os, sys
 import torch
 import json
 from dataclasses import dataclass
+import time
 
 
 from datasets import load_dataset
@@ -49,7 +50,7 @@ class GenerationConfig(Config):
         # Inference config
         self.server_type = "deepseek"
         self.model_name = "deepseek-coder"
-        self.max_tokens = 4096
+        self.max_tokens = 8192
         self.temperature = 0.0
         
         # Logging
@@ -109,7 +110,7 @@ def generate_sample_single(work: WorkArgs, config: GenerationConfig, dataset, in
     # Query server with constructed prompt
     custom_cuda, tokens = inference_server(custom_cuda_prompt)
     print(f"Custom CUDA: {custom_cuda}")
-    custom_cuda, original_code = extract_first_code(custom_cuda, ["python", "cpp"])
+    custom_cuda, original_code, _ = extract_first_code(custom_cuda, ["python", "cpp"])
     # check LLM is able to generate custom CUDA code
     assert custom_cuda is not None, "Custom CUDA code generation failed"
 
@@ -120,6 +121,7 @@ def generate_sample_single(work: WorkArgs, config: GenerationConfig, dataset, in
     kernel_path = os.path.join(run_dir, f"level_{config.level}_problem_{work.problem_id}_sample_{work.sample_id}_kernel.py")
     with open(kernel_path, "w") as f:
         f.write(custom_cuda)
+    time.sleep(30)
     
     return True
     

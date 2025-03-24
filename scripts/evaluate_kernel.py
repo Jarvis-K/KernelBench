@@ -121,7 +121,7 @@ def evaluate_kernel_wrapper(
         }
     
 # 添加一个完全隔离的评估函数
-def evaluate_kernel_isolated(ref_arch_src, code, build_dir, device_id, verbose, num_correct_trials, num_perf_trials, use_ncu):
+def evaluate_kernel_isolated(ref_arch_src, code, build_dir, device_id, verbose, num_correct_trials, num_perf_trials, use_ncu=False):
     """
     在完全隔离的进程中评估内核，确保GPU异常不会影响其他评估任务
     """
