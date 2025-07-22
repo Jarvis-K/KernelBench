@@ -1,0 +1,36 @@
+{
+  "citation": "",
+  "description": "",
+  "features": {
+    "index": {
+      "dtype": "int16",
+      "_type": "Value"
+    },
+    "operator_name": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "filename": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "code": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "description": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "file_size": {
+      "dtype": "int32",
+      "_type": "Value"
+    },
+    "line_count": {
+      "dtype": "int16",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": ""
+}
