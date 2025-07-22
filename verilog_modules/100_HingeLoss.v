@@ -1,0 +1,27 @@
+//
+// Verilog module for: HingeLoss
+// Generated from: 100_HingeLoss.py
+// Description: A model that computes Hinge Loss for binary classification tasks.
+
+    Parameters:
+        None
+//
+
+module HingeLoss_module_100 (
+    input clk,
+    input rst_n,
+    input valid_in,
+    output valid_out,
+    // Add specific ports based on operator type
+    input [31:0] input_data,
+    output [31:0] output_data
+);
+
+    // Module implementation would go here
+    // This is a template - actual implementation depends on the operator
+    
+        // Generic operator implementation
+    assign output_data = input_data; // Placeholder
+    assign valid_out = valid_in;
+
+endmodule
